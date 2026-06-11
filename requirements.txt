@@ -1,0 +1,7 @@
+# VideoSplitTool V3 后端 Python 依赖
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.10.0
+Pillow>=9.0.0
+python-multipart>=0.0.18
+websockets>=13.0

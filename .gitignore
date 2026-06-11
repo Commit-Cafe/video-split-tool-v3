@@ -1,0 +1,15 @@
+node_modules/
+dist/
+dist-electron/
+release/
+*.pyc
+__pycache__/
+*.pyo
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+*.log
+.env
+.DS_Store
+Thumbs.db

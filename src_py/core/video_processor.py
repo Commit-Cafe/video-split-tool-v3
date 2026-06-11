@@ -1,0 +1,1675 @@
+"""
+视频处理核心模块
+使用FFmpeg进行视频分割和拼接
+"""
+import subprocess
+import os
+import uuid
+from typing import Callable, Optional
+from dataclasses import dataclass
+
+from .ffmpeg_utils import get_ffmpeg_path, FFmpegHelper
+from .error_handler import ErrorDiagnostics, format_error_message
+from ..utils.logger import logger
+from ..utils.file_utils import get_temp_dir
+
+
+@dataclass
+class ProcessResult:
+    """处理结果"""
+    success: bool
+    message: str = ""
+    error: str = ""
+
+
+def _make_even(n: int, min_value: int = 2) -> int:
+    """确保数值是偶数（libx264要求宽高必须是偶数），最小值为2"""
+    result = n if n % 2 == 0 else n - 1
+    return max(result, min_value)
+
+
+def _build_scale_filter(width: int, height: int, mode: str = "stretch") -> str:
+    """
+    根据缩放模式构建FFmpeg scale滤镜字符串
+
+    Args:
+        width: 目标宽度
+        height: 目标高度
+        mode: 缩放模式
+            - "stretch": 拉伸填满（可能变形）
+            - "fill": 填充裁切（保持比例，裁剪超出部分）
+            - "fit": 适应留黑边（保持比例，添加黑边）
+
+    Returns:
+        FFmpeg scale滤镜字符串
+    """
+    if mode == "fill":
+        # 填充模式：放大到覆盖目标区域，然后居中裁剪
+        return (
+            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height}"
+        )
+    elif mode == "fit":
+        # 适应模式：缩小到适应目标区域，然后居中添加黑边
+        return (
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black"
+        )
+    else:
+        # 拉伸模式（默认）：直接拉伸到目标尺寸
+        return f"scale={width}:{height}:force_original_aspect_ratio=disable"
+
+
+# Logo 位置常量（已废弃：位置改为 X/Y 中心点百分比）
+
+
+def _logo_overlay_xy_from_center(
+    x_percent: int,
+    y_percent: int
+) -> str:
+    """
+    根据 logo 中心点百分比计算 FFmpeg overlay 滤镜的 x:y 表达式（logo 左上角）
+    语义：(X%, Y%) 是 logo 中心在视频中的位置
+        - (0%, 0%)   = 视频左上角（logo 中心在角点，logo 一半溢出）
+        - (50%, 50%) = 视频中心（logo 居中）
+        - (100%, 100%) = 视频右下角
+    转换：logo 左上角 = (W*X/100 - w/2, H*Y/100 - h/2)
+    """
+    x = max(0, min(100, int(x_percent)))
+    y = max(0, min(100, int(y_percent)))
+    return f"W*{x}/100-w/2:H*{y}/100-h/2"
+
+
+def _logo_size_filter(logo_size_percent: int) -> str:
+    """
+    根据百分比构造 logo 缩放滤镜
+    按输出视频宽度百分比缩放，高度按比例
+    """
+    return f"scale=iw*{int(logo_size_percent)}/100:-1"
+
+
+class VideoProcessor:
+    """视频处理器"""
+
+    @staticmethod
+    def _check_output_writability(output_dir: str) -> tuple:
+        """
+        检查输出目录是否可写入，给出可操作的诊断信息
+
+        Args:
+            output_dir: 待检查的目录绝对路径
+
+        Returns:
+            (ok: bool, message: str):
+              - ok=True: 目录存在且可写，message 为空
+              - ok=False: 目录有问题，message 为详细诊断
+        """
+        import uuid as _uuid
+
+        if not output_dir:
+            return False, "输出目录路径为空"
+
+        # 规范化路径（去除尾随空格、点等不可见字符），但不与原值比较
+        # normpath 会被短路径/长路径（Windows 8.3）触发误报，这里只用于显示
+        normalized = os.path.normpath(output_dir)
+
+        if not os.path.exists(normalized):
+            return False, f"输出目录不存在: {normalized}\n请确认路径正确"
+
+        if not os.path.isdir(normalized):
+            return False, f"输出路径不是目录: {normalized}"
+
+        # 检查写权限（os.access 仅检查权限位，不实际写入）
+        if not os.access(normalized, os.W_OK):
+            return False, (
+                f"输出目录无写权限: {normalized}\n"
+                f"  可能原因：\n"
+                f"    1. 目录是只读的\n"
+                f"    2. 当前用户没有该目录的写权限（右键 → 属性 → 安全）\n"
+                f"    3. 目录被 OneDrive/Google Drive/Dropbox 等云盘锁定"
+            )
+
+        # 实际写一个临时文件验证（捕获云盘同步中临时锁定等隐蔽问题）
+        test_path = os.path.join(normalized, f".write_test_{_uuid.uuid4().hex}.tmp")
+        try:
+            with open(test_path, 'w', encoding='utf-8') as f:
+                f.write('test')
+            os.remove(test_path)
+            return True, ""
+        except PermissionError as e:
+            return False, (
+                f"输出目录被锁定（实际写入失败）: {normalized}\n"
+                f"  错误: {e}\n"
+                f"  可能原因：\n"
+                f"    1. 该目录被 OneDrive/Google Drive/Dropbox 等云盘同步中（同步过程会临时锁定）\n"
+                f"    2. 该目录被其他程序占用（如 Telegram 客户端、杀毒软件）\n"
+                f"    3. 当前用户没有该目录的写权限\n"
+                f"  建议：换一个本地非云同步目录（如 D:\\Videos\\）"
+            )
+        except OSError as e:
+            return False, f"写入测试失败: {normalized}\n  错误: {e}"
+
+    # 拼接方式常量
+    MERGE_A_C = "a+c"  # 模板左/上 + 列表左/上
+    MERGE_A_D = "a+d"  # 模板左/上 + 列表右/下
+    MERGE_B_C = "b+c"  # 模板右/下 + 列表左/上
+    MERGE_B_D = "b+d"  # 模板右/下 + 列表右/下
+    MERGE_GRID = "grid"  # 四宫格
+
+    # 分割方式常量
+    SPLIT_HORIZONTAL = "horizontal"  # 左右分割
+    SPLIT_VERTICAL = "vertical"  # 上下分割
+
+    def __init__(self):
+        self.temp_dir = get_temp_dir()
+        self._progress_callback: Optional[Callable[[float, str], None]] = None
+        self.last_error = ""
+
+    def set_progress_callback(self, callback: Callable[[float, str], None]):
+        """设置进度回调函数"""
+        self._progress_callback = callback
+
+    def _report_progress(self, progress: float, message: str):
+        """报告进度"""
+        if self._progress_callback:
+            self._progress_callback(progress, message)
+
+    def _validate_output_file(self, output_path: str) -> tuple:
+        """
+        验证输出视频文件是否有效（防止 FFmpeg 写出 0 字节或损坏的文件）
+
+        检查项：
+          1. 文件存在
+          2. 文件大小 > 1KB（FFmpeg 最小的视频文件至少几 KB）
+          3. 文件包含 ISOBMFF 'ftyp' 头（offset 4-7，MP4/MOV/M4V/MKV/WebM 等容器都使用此头）
+          4. 文件前 16 字节不全为 0（防止写入 0 字节失败）
+
+        Returns:
+            (ok: bool, message: str):
+              - ok=True: 文件有效
+              - ok=False: 文件有问题，message 为详细诊断
+        """
+        if not os.path.exists(output_path):
+            return False, f"输出文件不存在: {output_path}"
+
+        try:
+            file_size = os.path.getsize(output_path)
+        except OSError as e:
+            return False, f"无法读取输出文件大小: {e}"
+
+        if file_size < 1024:
+            return False, (
+                f"输出文件太小 ({file_size} bytes)，可能已损坏。\n"
+                f"  文件路径: {output_path}\n"
+                f"  可能原因：\n"
+                f"    1. FFmpeg 处理时崩溃（查看下方 FFmpeg 错误日志）\n"
+                f"    2. 模板视频或 logo 文件异常\n"
+                f"    3. 输出目录写权限问题（虽然已通过前期检查）"
+            )
+
+        # 检查 ISOBMFF 'ftyp' 头（MP4/MOV/M4V 等 ISO 基础媒体格式都使用此 magic）
+        # 注：MKV/WebM 不使用 ftyp 头，但项目输出格式限定为 .mp4/.mov/.m4v
+        # 见 utils/file_utils.VALID_VIDEO_EXTENSIONS
+        expected_ext = os.path.splitext(output_path)[1].lower()
+        try:
+            with open(output_path, 'rb') as f:
+                header = f.read(32)
+            # 文件头检查：根据扩展名采用不同策略
+            if expected_ext in ('.mp4', '.mov', '.m4v'):
+                # ISOBMFF 容器：必须以 ftyp 开头
+                if len(header) < 8 or header[4:8] != b'ftyp':
+                    return False, (
+                        f"输出文件不是有效的 {expected_ext.upper()[1:]} 格式（缺少 ftyp 头）。\n"
+                        f"  文件路径: {output_path}\n"
+                        f"  文件大小: {file_size} bytes\n"
+                        f"  文件头(hex): {header[:16].hex()}\n"
+                        f"  可能原因：\n"
+                        f"    1. FFmpeg mux 失败（codec 不兼容）\n"
+                        f"    2. 模板视频包含 FFmpeg 不支持的编码"
+                    )
+            # 检查文件头不全为 0（防止 0 字节写入）
+            if all(b == 0 for b in header[:16]):
+                return False, (
+                    f"输出文件头部全为 0 字节，写入失败。\n"
+                    f"  文件路径: {output_path}\n"
+                    f"  文件大小: {file_size} bytes"
+                )
+        except OSError as e:
+            return False, f"读取输出文件头失败: {e}"
+
+        return True, ""
+
+    def _run_ffmpeg(self, cmd: list, description: str = "", context: dict = None) -> tuple:
+        """
+        运行FFmpeg命令，返回(成功与否, 错误信息)
+
+        Args:
+            cmd: FFmpeg命令列表
+            description: 操作描述
+            context: 上下文信息（用于错误诊断）
+        """
+        # 默认 10 分钟超时（视频处理可能很慢，大文件 4K 需更久）
+        timeout = context.get('timeout', 600) if context else 600
+        try:
+            logger.info(f"执行FFmpeg命令: {description} (timeout={timeout}s)")
+            logger.info(f"FFmpeg完整命令: {' '.join(cmd)}")
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=timeout,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+            )
+
+            if result.returncode != 0:
+                logger.error(f"FFmpeg执行失败，返回码: {result.returncode}")
+                logger.error(f"FFmpeg stderr:\n{result.stderr}")
+
+                # 使用智能错误诊断
+                error_desc, suggestions = ErrorDiagnostics.diagnose_ffmpeg_error(
+                    result.stderr,
+                    context
+                )
+                error_msg = format_error_message(error_desc, suggestions)
+
+                # 附加FFmpeg完整错误输出，方便定位具体原因
+                if result.stderr.strip():
+                    stderr_short = result.stderr.strip()
+                    if len(stderr_short) > 800:
+                        stderr_short = "..." + stderr_short[-800:]
+                    error_msg += f"\n\nFFmpeg完整错误:\n{stderr_short}"
+
+                return False, error_msg
+
+            logger.info(f"FFmpeg执行成功: {description}")
+            return True, ""
+
+        except FileNotFoundError:
+            logger.error("FFmpeg未找到")
+            return False, "FFmpeg未找到，请确保已安装并添加到PATH"
+        except subprocess.TimeoutExpired:
+            logger.error(f"FFmpeg执行超时（{timeout}s）: {description}")
+            return False, (
+                f"FFmpeg执行超时（{timeout}秒）。\n"
+                f"可能原因：\n"
+                f"  • 视频文件过大或损坏导致 FFmpeg 卡死\n"
+                f"  • 输出目录写入缓慢（如云同步目录 OneDrive/Dropbox）\n"
+                f"建议：换一个本地非云同步目录，或检查视频文件是否完整"
+            )
+        except Exception as e:
+            logger.exception(f"运行FFmpeg异常: {e}")
+            return False, f"运行FFmpeg失败: {str(e)}"
+
+    def process_videos(
+        self,
+        template_video: str,
+        target_video: str,
+        output_path: str,
+        split_mode: str,
+        merge_mode: str,
+        split_ratio: float = 0.5,
+        target_split_ratio: float = None,
+        target_scale_percent: int = 100,
+        cover_type: str = "none",
+        cover_frame_time: float = 0.0,
+        cover_image_path: str = None,
+        cover_duration: float = 3.0,
+        cover_frame_source: str = "template",
+        position_order: str = "template_first",
+        audio_source: str = "template",
+        custom_audio_path: str = None,
+        output_width: int = None,
+        output_height: int = None,
+        scale_mode: str = None,
+        output_ratio: float = None,
+        duration_mode: str = "template",
+        template_scale_mode: str = "fit",
+        list_scale_mode: str = "fit",
+        template_volume: int = 100,
+        list_volume: int = 100,
+        custom_volume: int = 100,
+        divider_mask_path: str = None,
+        divider_color: str = "#FFFFFF",
+        divider_width: int = 0,
+        process_mode: str = "split",
+        # ========== 图片 logo 叠加参数 ==========
+        logo_enabled: bool = False,
+        logo_path: str = None,
+        logo_size_percent: int = 20,
+        logo_x_percent: int = 50,
+        logo_y_percent: int = 50,
+        logo_angle: float = 0.0,
+        logo_opacity: float = 1.0
+    ) -> ProcessResult:
+        """
+        处理视频：分割并拼接
+
+        Args:
+            template_video: 模板视频路径
+            target_video: 目标视频路径
+            output_path: 输出路径
+            split_mode: 分割方式 (horizontal/vertical)
+            merge_mode: 拼接方式 (a+c, a+d, b+c, b+d, grid)
+            split_ratio: 模板视频分割比例 (0.1-0.9)
+            target_split_ratio: 目标视频分割比例 (0.1-0.9)
+            target_scale_percent: 目标视频缩放百分比 (50-200)
+            cover_type: 封面类型 (none/frame/image)
+            cover_frame_time: 封面帧时间点（秒）
+            cover_image_path: 封面图片路径
+            cover_duration: 封面显示时长（秒）
+            cover_frame_source: 封面帧来源 (template/list/merged)
+            position_order: 位置顺序 (template_first/list_first)
+            audio_source: 音频来源 (template/list/mix/custom/none)
+            custom_audio_path: 自定义音频文件路径
+            output_width: 自定义输出宽度
+            output_height: 自定义输出高度
+            scale_mode: 缩放模式 (fit/fill/stretch) - 通用模式，如未指定独立模式则使用此值
+            output_ratio: 输出比例 - 上/左部分在输出中占的比例 (0.1-0.9)，None表示跟随split_ratio
+            duration_mode: 输出时长模式 (template/list)
+            template_scale_mode: 模板视频缩放模式 (fit/fill/stretch)
+            list_scale_mode: 列表视频缩放模式 (fit/fill/stretch)
+            template_volume: 模板音频音量百分比 (0-200)
+            list_volume: 列表音频音量百分比 (0-200)
+            custom_volume: 自定义音频音量百分比 (0-200)
+
+        Returns:
+            ProcessResult: 处理结果
+        """
+        temp_files = []
+
+        try:
+            self._report_progress(0.05, "获取视频信息")
+
+            if target_split_ratio is None:
+                target_split_ratio = split_ratio
+
+            # 检查文件是否存在
+            if not os.path.exists(template_video):
+                return ProcessResult(False, error=f"模板视频不存在: {template_video}")
+            if not os.path.exists(target_video):
+                return ProcessResult(False, error=f"目标视频不存在: {target_video}")
+
+            # 获取视频信息
+            template_info = FFmpegHelper.get_video_info(template_video)
+            target_info = FFmpegHelper.get_video_info(target_video)
+
+            if not template_info:
+                return ProcessResult(False, error="无法获取模板视频信息，文件可能损坏")
+            if not target_info:
+                return ProcessResult(False, error="无法获取目标视频信息，文件可能损坏")
+
+            # 检查视频尺寸
+            if template_info.width == 0 or template_info.height == 0:
+                return ProcessResult(False, error="模板视频尺寸无效")
+            if target_info.width == 0 or target_info.height == 0:
+                return ProcessResult(False, error="目标视频尺寸无效")
+
+            # 确定输出尺寸
+            if output_width is not None and output_height is not None and output_width > 0 and output_height > 0:
+                out_width = output_width
+                out_height = output_height
+                logger.info(f"使用自定义输出尺寸: {out_width}x{out_height}")
+            else:
+                out_width = template_info.width
+                out_height = template_info.height
+                logger.info(f"使用模板视频尺寸: {out_width}x{out_height}")
+
+            # 确保输出尺寸足够大（分割比例最小0.1，每部分至少需要2px）
+            out_width = _make_even(out_width)
+            out_height = _make_even(out_height)
+            if out_width < 4 or out_height < 4:
+                return ProcessResult(False, error=f"输出尺寸过小({out_width}x{out_height})，至少需要4x4像素")
+
+            # 根据 duration_mode 确定输出时长
+            if duration_mode == "list":
+                max_duration = target_info.duration
+                logger.info(f"使用列表视频时长: {max_duration:.2f}秒")
+            else:
+                max_duration = template_info.duration
+                logger.info(f"使用模板视频时长: {max_duration:.2f}秒")
+
+            if max_duration <= 0:
+                return ProcessResult(False, error="视频时长无效")
+
+            # 检查音频状态
+            template_has_audio = template_info.has_audio
+            target_has_audio = target_info.has_audio
+            logger.debug(f"音频状态: 模板={template_has_audio}, 目标={target_has_audio}, 音频来源={audio_source}")
+
+            # 检查模板视频是否有透明通道
+            template_has_alpha = template_info.has_alpha
+            logger.info(f"模板视频透明通道: {template_has_alpha}")
+
+            self._report_progress(0.1, "构建处理命令")
+
+            # 验证自定义音频文件
+            if audio_source == "custom" and custom_audio_path:
+                if not os.path.exists(custom_audio_path):
+                    return ProcessResult(False, error=f"自定义音频文件不存在: {custom_audio_path}")
+
+            # 构建filter_complex
+            try:
+                # 如果没有指定 output_ratio，则使用 split_ratio
+                actual_output_ratio = output_ratio if output_ratio is not None else split_ratio
+
+                # 检查是否使用曲线蒙版
+                use_mask = divider_mask_path and os.path.exists(divider_mask_path)
+
+                # image_logo 模式：验证 logo 文件
+                if process_mode == "image_logo" and logo_enabled:
+                    if not logo_path:
+                        return ProcessResult(False, error="图片 logo 模式必须提供 logo 图片路径")
+                    if not os.path.exists(logo_path):
+                        return ProcessResult(False, error=f"Logo 图片不存在: {logo_path}")
+                    try:
+                        from .image_utils import get_image_info
+                        logo_info = get_image_info(logo_path)
+                        if not logo_info:
+                            return ProcessResult(False, error=f"Logo 图片格式无效: {logo_path}")
+                        logger.info(
+                            f"使用图片 logo 叠加模式: {os.path.basename(logo_path)} "
+                            f"({logo_info.width}x{logo_info.height}"
+                            f"{', 含透明通道' if logo_info.has_alpha else ''})"
+                        )
+                    except Exception as e:
+                        return ProcessResult(False, error=f"无法读取 logo 图片: {e}")
+
+                # 检查是否使用图片 logo 模式
+                if process_mode == "image_logo":
+                    filter_complex = self._build_image_logo_filter_complex(
+                        out_width, out_height,
+                        logo_path=logo_path,
+                        logo_size_percent=logo_size_percent,
+                        logo_x_percent=logo_x_percent,
+                        logo_y_percent=logo_y_percent,
+                        logo_angle=logo_angle,
+                        logo_opacity=logo_opacity
+                    )
+                    # 修复：image_logo 模式的 _build_image_logo_filter_complex 只返回视频滤镜
+                    # 音频滤镜 [outa] 需要在此追加（否则 -map [outa] 会找不到标签）
+                    # image_logo 模式没有列表视频，list/mix 模式都降级为模板音频
+                    if audio_source == "template" and template_has_audio:
+                        template_vol = float(template_volume) / 100.0
+                        filter_complex = filter_complex + f";[0:a]volume={template_vol}[outa]"
+                    elif audio_source in ("list", "mix") and template_has_audio:
+                        # image_logo 没有列表视频，list/mix 等同于 template
+                        template_vol = float(template_volume) / 100.0
+                        filter_complex = filter_complex + f";[0:a]volume={template_vol}[outa]"
+                    # audio_source == "custom" 由下方 line 525-529 单独处理
+                    # audio_source == "none" 不需要音频滤镜
+                # 检查是否使用视频叠加模式
+                elif process_mode == "overlay":
+                    logger.info("使用视频叠加模式")
+                    filter_complex = self._build_overlay_filter_complex(
+                        out_width, out_height,
+                        template_has_audio, target_has_audio,
+                        audio_source,
+                        scale_mode or "fit",
+                        template_scale_mode,
+                        list_scale_mode,
+                        template_volume,
+                        list_volume
+                    )
+                # 检查是否使用透明通道模式（模板视频有alpha通道时）
+                elif template_has_alpha and not use_mask:
+                    logger.info("检测到模板视频有透明通道，使用overlay模式")
+                    filter_complex = self._build_alpha_filter_complex(
+                        split_mode, merge_mode,
+                        split_ratio, target_split_ratio,
+                        out_width, out_height,
+                        template_has_audio, target_has_audio,
+                        target_scale_percent,
+                        position_order,
+                        audio_source,
+                        scale_mode or "fit",
+                        actual_output_ratio,
+                        template_scale_mode,
+                        list_scale_mode,
+                        template_volume,
+                        list_volume
+                    )
+                elif use_mask:
+                    logger.info(f"使用曲线蒙版: {divider_mask_path}")
+                    filter_complex = self._build_mask_filter_complex(
+                        out_width, out_height,
+                        template_has_audio, target_has_audio,
+                        position_order,
+                        audio_source,
+                        template_scale_mode,
+                        list_scale_mode,
+                        template_volume,
+                        list_volume,
+                        divider_color,
+                        divider_width
+                    )
+                else:
+                    filter_complex = self._build_filter_complex(
+                        split_mode, merge_mode,
+                        split_ratio, target_split_ratio,
+                        out_width, out_height,
+                        template_info.duration, target_info.duration,
+                        template_has_audio, target_has_audio,
+                        target_scale_percent,
+                        position_order,
+                        audio_source,
+                        scale_mode or "fit",
+                        actual_output_ratio,
+                        template_scale_mode,
+                        list_scale_mode,
+                        template_volume,
+                        list_volume
+                    )
+            except ValueError as e:
+                return ProcessResult(False, error=str(e))
+
+            base_name, ext = os.path.splitext(output_path)
+            # 用完整 UUID4（32 字符）避免大批量并发时碰撞（截断到 8 字符碰撞概率 1/2^32）
+            temp_output_path = f"{base_name}.tmp_{uuid.uuid4().hex}{ext}"
+
+            # 确保输出目录存在
+            output_dir = os.path.dirname(os.path.abspath(output_path))
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+
+            # 验证输出目录可写入（使用详细诊断版本）
+            output_dir_check = os.path.dirname(os.path.abspath(output_path))
+            ok, diag_msg = self._check_output_writability(output_dir_check)
+            if not ok:
+                logger.error(f"输出目录写权限检查失败: {diag_msg}")
+                return ProcessResult(False, error=diag_msg)
+
+            ffmpeg = get_ffmpeg_path()
+            if process_mode == "image_logo" and logo_enabled:
+                # 图片 logo 模式：[0:v]=主视频(模板), [1:v]=logo 图片
+                # 不需要 target_video（列表视频）
+                cmd = [
+                    ffmpeg, '-y',
+                    '-stream_loop', '-1', '-i', template_video,
+                    '-loop', '1', '-i', logo_path,
+                ]
+            else:
+                cmd = [
+                    ffmpeg, '-y',
+                    '-stream_loop', '-1', '-i', template_video,
+                    '-stream_loop', '-1', '-i', target_video,
+                ]
+
+            # 如果使用蒙版，添加蒙版图片作为输入
+            if use_mask:
+                cmd.extend(['-i', divider_mask_path])
+
+            if audio_source == "custom" and custom_audio_path:
+                cmd.extend(['-stream_loop', '-1', '-i', custom_audio_path])
+
+            # 如果是自定义音频，添加音量滤镜
+            # 注意：当使用蒙版时，输入索引会发生变化
+            if audio_source == "custom" and custom_audio_path:
+                custom_vol = custom_volume / 100.0
+                audio_label = "[3:a]" if use_mask else "[2:a]"
+                custom_audio_filter = f";{audio_label}volume={custom_vol}[outa]"
+                filter_complex = filter_complex + custom_audio_filter
+
+            cmd.extend([
+                '-filter_complex', filter_complex,
+                '-map', '[outv]',
+            ])
+
+            # 音频映射
+            has_audio_output = False
+            if audio_source == "none":
+                logger.debug("音频模式: 静音，不映射音频")
+            elif audio_source == "custom" and custom_audio_path:
+                cmd.extend(['-map', '[outa]'])
+                cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
+                has_audio_output = True
+            elif audio_source == "template" and template_has_audio:
+                cmd.extend(['-map', '[outa]'])
+                cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
+                has_audio_output = True
+            elif audio_source == "list" and target_has_audio:
+                cmd.extend(['-map', '[outa]'])
+                cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
+                has_audio_output = True
+            elif audio_source == "mix" and (template_has_audio or target_has_audio):
+                cmd.extend(['-map', '[outa]'])
+                cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
+                has_audio_output = True
+
+            # 根据是否有alpha通道选择输出编码
+            if template_has_alpha and output_path.lower().endswith('.mov'):
+                # MOV格式支持alpha通道，使用ProRes 4444编码
+                cmd.extend([
+                    '-t', str(max_duration),
+                    '-c:v', 'prores_ks',
+                    '-profile:v', '4444',
+                    '-pix_fmt', 'yuva444p10le',
+                    temp_output_path
+                ])
+                logger.info("使用ProRes 4444编码（支持透明通道）")
+            else:
+                cmd.extend([
+                    '-t', str(max_duration),
+                    '-c:v', 'libx264',
+                    '-preset', 'medium',
+                    '-crf', '23',
+                    temp_output_path
+                ])
+
+            self._report_progress(0.2, "处理视频")
+
+            success, error_msg = self._run_ffmpeg(cmd, "处理视频")
+
+            if not success:
+                self._report_progress(0, "处理失败")
+                self._safe_remove(temp_output_path)
+                return ProcessResult(False, error=error_msg)
+
+            if not self._safe_rename(temp_output_path, output_path):
+                return ProcessResult(False, error=f"无法重命名临时文件到目标路径: {output_path}")
+
+            # 验证输出文件（防止 FFmpeg 写出 0 字节或损坏的文件）
+            ok, validation_msg = self._validate_output_file(output_path)
+            if not ok:
+                return ProcessResult(False, error=validation_msg)
+
+            # 处理封面
+            if cover_type != "none" and success:
+                self._report_progress(0.8, "处理封面")
+                if cover_frame_source == "template":
+                    frame_source_video = template_video
+                elif cover_frame_source == "list":
+                    frame_source_video = target_video
+                elif cover_frame_source == "merged":
+                    frame_source_video = output_path
+                else:
+                    frame_source_video = target_video
+
+                cover_result = self._add_cover_to_video(
+                    output_path, out_width, out_height,
+                    cover_type, cover_frame_time, cover_image_path,
+                    cover_duration, frame_source_video, temp_files
+                )
+                if not cover_result.success:
+                    return cover_result
+
+            # 清理临时文件
+            self._cleanup_temp_files(temp_files)
+
+            self._report_progress(1.0, "处理完成")
+            return ProcessResult(True, message="处理成功")
+
+        except Exception as e:
+            self._cleanup_temp_files(temp_files)
+            error_msg = f"处理异常: {str(e)}"
+            self._report_progress(0, error_msg)
+            return ProcessResult(False, error=error_msg)
+
+    def _add_cover_to_video(
+        self,
+        video_path: str,
+        width: int,
+        height: int,
+        cover_type: str,
+        cover_frame_time: float,
+        cover_image_path: str,
+        cover_duration: float,
+        source_video: str,
+        temp_files: list
+    ) -> ProcessResult:
+        """为视频添加封面"""
+        temp_dir = get_temp_dir()
+        # 用完整 UUID4 避免碰撞
+        unique_id = uuid.uuid4().hex
+
+        try:
+            if cover_type == "frame":
+                cover_frame_path = os.path.join(temp_dir, f"cover_frame_{unique_id}.jpg")
+                if not FFmpegHelper.extract_frame(source_video, cover_frame_path, cover_frame_time):
+                    return ProcessResult(False, error="提取封面帧失败")
+                temp_files.append(cover_frame_path)
+                image_path = cover_frame_path
+            elif cover_type == "image":
+                if not cover_image_path or not os.path.exists(cover_image_path):
+                    return ProcessResult(False, error="封面图片不存在")
+                image_path = cover_image_path
+            else:
+                return ProcessResult(True)
+
+            # 将封面图片转换为视频
+            cover_video_path = os.path.join(temp_dir, f"cover_video_{unique_id}.mp4")
+            if not FFmpegHelper.image_to_video(image_path, cover_video_path, cover_duration, width, height):
+                return ProcessResult(False, error="封面图片转视频失败")
+            temp_files.append(cover_video_path)
+
+            # 拼接封面视频和主视频
+            final_output = os.path.join(temp_dir, f"final_{unique_id}.mp4")
+            ffmpeg = get_ffmpeg_path()
+            main_has_audio = FFmpegHelper.check_has_audio(video_path)
+            logger.debug(f"封面处理: 主视频音频状态={main_has_audio}, video_path={video_path}")
+
+            if main_has_audio:
+                # 使用标准采样率44100Hz（最常见的采样率）
+                sample_rate = 44100
+                logger.debug(f"封面处理: 生成静音封面音频，采样率={sample_rate}Hz")
+
+                cmd = [
+                    ffmpeg, '-y',
+                    '-i', cover_video_path,
+                    '-i', video_path,
+                    '-filter_complex',
+                    f'[0:v]scale={width}:{height}:force_original_aspect_ratio=disable,setsar=1[v0];'
+                    f'[1:v]scale={width}:{height}:force_original_aspect_ratio=disable,setsar=1[v1];'
+                    f'[v0][v1]concat=n=2:v=1:a=0[outv];'
+                    f'anullsrc=channel_layout=stereo:sample_rate={sample_rate}:duration={cover_duration}[a0];'
+                    f'[a0][1:a]concat=n=2:v=0:a=1[outa]',
+                    '-map', '[outv]',
+                    '-map', '[outa]',
+                    '-c:v', 'libx264',
+                    '-c:a', 'aac',
+                    '-b:a', '128k',
+                    '-preset', 'medium',
+                    '-crf', '23',
+                    final_output
+                ]
+            else:
+                cmd = [
+                    ffmpeg, '-y',
+                    '-i', cover_video_path,
+                    '-i', video_path,
+                    '-filter_complex',
+                    f'[0:v]scale={width}:{height}:force_original_aspect_ratio=disable,setsar=1[v0];'
+                    f'[1:v]scale={width}:{height}:force_original_aspect_ratio=disable,setsar=1[v1];'
+                    f'[v0][v1]concat=n=2:v=1:a=0[outv]',
+                    '-map', '[outv]',
+                    '-c:v', 'libx264',
+                    '-preset', 'medium',
+                    '-crf', '23',
+                    final_output
+                ]
+
+            success, error_msg = self._run_ffmpeg(cmd, "添加封面")
+
+            if success:
+                self._safe_rename(final_output, video_path)
+                return ProcessResult(True)
+            else:
+                # 失败时清理 final_output（之前会残留）
+                self._safe_remove(final_output)
+                return ProcessResult(False, error=f"添加封面失败: {error_msg}")
+
+        except Exception as e:
+            return ProcessResult(False, error=f"添加封面异常: {str(e)}")
+
+    def _cleanup_temp_files(self, temp_files: list):
+        """清理临时文件"""
+        for temp_file in temp_files:
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except OSError as e:
+                logger.warning(f"无法删除临时文件 {temp_file}: {e}")
+
+    @staticmethod
+    def _safe_rename(src: str, dst: str, retries: int = 5) -> bool:
+        """安全重命名文件，支持重试"""
+        for attempt in range(retries):
+            try:
+                if os.path.exists(dst):
+                    os.remove(dst)
+                os.rename(src, dst)
+                return True
+            except OSError as e:
+                if attempt < retries - 1:
+                    import time
+                    time.sleep(0.1 * (attempt + 1))
+                else:
+                    logger.error(f"重命名文件失败 (尝试{retries}次): {src} -> {dst}, 错误: {e}")
+                    return False
+        return False
+
+    @staticmethod
+    def _safe_remove(path: str):
+        """安全删除文件"""
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError as e:
+            logger.warning(f"无法删除文件 {path}: {e}")
+
+    def _build_overlay_filter_complex(
+        self,
+        out_width: int,
+        out_height: int,
+        template_has_audio: bool = True,
+        target_has_audio: bool = True,
+        audio_source: str = "template",
+        scale_mode: str = "fit",
+        template_scale_mode: str = "fit",
+        list_scale_mode: str = "fit",
+        template_volume: int = 100,
+        list_volume: int = 100
+    ) -> str:
+        """
+        构建视频叠加滤镜 - 前景视频（模板）居中叠加在背景视频（列表）上
+
+        Args:
+            out_width: 输出宽度
+            out_height: 输出高度
+            template_has_audio: 模板是否有音频
+            target_has_audio: 目标是否有音频
+            audio_source: 音频来源
+            scale_mode: 通用缩放模式（**已废弃**：叠加模式分别用 template_scale_mode/list_scale_mode）
+            template_scale_mode: 模板缩放模式
+            list_scale_mode: 列表缩放模式
+            template_volume: 模板音量
+            list_volume: 列表音量
+        """
+        out_width = _make_even(out_width)
+        out_height = _make_even(out_height)
+
+        # scale_mode 保留参数以兼容旧调用方（叠加模式按视频维度分别缩放更合理）
+        _ = scale_mode  # noqa: F841 - 显式标记不使用，避免 IDE 误报
+
+        template_vol = template_volume / 100.0
+        list_vol = list_volume / 100.0
+
+        # 音频滤镜
+        audio_filter = None
+        if audio_source == "mix":
+            if template_has_audio and target_has_audio:
+                audio_filter = f"[0:a]volume={template_vol}[a0];[1:a]volume={list_vol}[a1];[a0][a1]amix=inputs=2:duration=longest[outa]"
+            elif template_has_audio:
+                audio_filter = f"[0:a]volume={template_vol}[outa]"
+            elif target_has_audio:
+                audio_filter = f"[1:a]volume={list_vol}[outa]"
+        elif audio_source == "template":
+            if template_has_audio:
+                audio_filter = f"[0:a]volume={template_vol}[outa]"
+        elif audio_source == "list":
+            if target_has_audio:
+                audio_filter = f"[1:a]volume={list_vol}[outa]"
+
+        # 缩放滤镜 - 添加setsar=1确保像素尺寸为偶数
+        bg_scale = _build_scale_filter(out_width, out_height, list_scale_mode)
+        fg_scale = _build_scale_filter(out_width, out_height, template_scale_mode)
+
+        # [0:v]=模板(前景), [1:v]=列表(背景)
+        video_filter = (
+            f"[1:v]{bg_scale},setsar=1[bg];"
+            f"[0:v]{fg_scale},setsar=1[fg];"
+            f"[bg][fg]overlay=(W-w)/2:(H-h)/2:format=yuv420[outv]"
+        )
+
+        if audio_filter:
+            return f"{video_filter};{audio_filter}"
+        return video_filter
+
+    @staticmethod
+    def _build_image_logo_filter_complex(
+        out_width: int,
+        out_height: int,
+        logo_path: str = "",
+        logo_size_percent: int = 20,
+        logo_x_percent: int = 50,
+        logo_y_percent: int = 50,
+        logo_angle: float = 0.0,
+        logo_opacity: float = 1.0
+    ) -> str:
+        """
+        构建图片 logo 叠加 filter_complex 字符串
+        [1:v] 是 logo 图片输入，[0:v] 是主视频输入
+
+        Args:
+            out_width: 输出视频宽度
+            out_height: 输出视频高度
+            logo_path: logo 图片路径（仅用于错误信息，不影响滤镜构建）
+            logo_size_percent: logo 宽度占视频宽度的百分比 (1-100)
+            logo_x_percent: logo 中心点 X 位置 (0-100%)，0%=左边缘, 100%=右边缘
+            logo_y_percent: logo 中心点 Y 位置 (0-100%)，0%=上边缘, 100%=下边缘
+            logo_angle: 旋转角度（度），0 表示不旋转
+            logo_opacity: 不透明度 (0.0-1.0)
+        """
+        out_width = _make_even(out_width)
+        out_height = _make_even(out_height)
+
+        # 限制参数
+        size_pct = max(1, min(100, int(logo_size_percent)))
+        opacity = max(0.0, min(1.0, float(logo_opacity)))
+        # 旋转角度取模到 0-360，FFmpeg rotate 单位是弧度
+        angle_rad = float(logo_angle) % 360.0 * 3.14159265358979 / 180.0
+        # 透明度极小（接近 0）时直接返回主视频流避免滤镜报错
+        if opacity < 0.001:
+            return "[0:v]copy[outv]"
+
+        # 位置：logo 中心 = (X%, Y%) 视频区域
+        xy = _logo_overlay_xy_from_center(logo_x_percent, logo_y_percent)
+
+        # 旋转：填透明黑，旋转后保持 RGBA
+        # 注意：
+        #   1. FFmpeg 不识别 'transparent' 颜色名
+        #   2. 'fillcolor=0:0:0:0' 会被解析为 4 个独立选项（':' 是滤镜选项分隔符）
+        #   3. 必须用 8 字符十六进制 RGBA：'0x00000000' = R=0,G=0,B=0,A=0（完全透明黑）
+        rotate_filter = f"rotate={angle_rad}:fillcolor=0x00000000"
+
+        # 主滤镜链
+        size_filter = _logo_size_filter(size_pct)
+
+        # 注意：logo 输入编号是 [1:v]（列表视频是 [0:v]）
+        return (
+            f"[1:v]{size_filter},format=rgba,"
+            f"{rotate_filter},"
+            f"colorchannelmixer=aa={opacity:.4f}[logo];"
+            f"[0:v][logo]overlay={xy}:format=auto,format=yuv420p[outv]"
+        )
+
+    def _build_alpha_filter_complex(
+        self,
+        split_mode: str,
+        merge_mode: str,
+        split_ratio: float,
+        target_split_ratio: float,
+        out_width: int,
+        out_height: int,
+        template_has_audio: bool = True,
+        target_has_audio: bool = True,
+        target_scale_percent: int = 100,
+        position_order: str = "template_first",
+        audio_source: str = "template",
+        scale_mode: str = "fit",
+        output_ratio: float = None,
+        template_scale_mode: str = "fit",
+        list_scale_mode: str = "fit",
+        template_volume: int = 100,
+        list_volume: int = 100
+    ) -> str:
+        """
+        构建支持透明通道的filter_complex字符串
+        使用overlay滤镜将模板视频叠加到列表视频上，透明部分显示列表视频内容
+
+        Args:
+            参数同 _build_filter_complex
+        """
+        logger.debug(f"透明通道模式: 模板缩放={template_scale_mode}, 列表缩放={list_scale_mode}")
+        logger.debug(f"音量设置: 模板={template_volume}%, 列表={list_volume}%")
+
+        # 计算音量倍数
+        template_vol = template_volume / 100.0
+        list_vol = list_volume / 100.0
+
+        # 音频filter
+        audio_filter = None
+        if audio_source == "mix":
+            if template_has_audio and target_has_audio:
+                audio_filter = f"[0:a]volume={template_vol}[a0];[1:a]volume={list_vol}[a1];[a0][a1]amix=inputs=2:duration=longest[outa]"
+            elif template_has_audio:
+                audio_filter = f"[0:a]volume={template_vol}[outa]"
+            elif target_has_audio:
+                audio_filter = f"[1:a]volume={list_vol}[outa]"
+        elif audio_source == "template":
+            if template_has_audio:
+                audio_filter = f"[0:a]volume={template_vol}[outa]"
+        elif audio_source == "list":
+            if target_has_audio:
+                audio_filter = f"[1:a]volume={list_vol}[outa]"
+
+        scale_factor = target_scale_percent / 100.0
+        target_scaled_width = _make_even(int(out_width * scale_factor))
+        target_scaled_height = _make_even(int(out_height * scale_factor))
+        out_width = _make_even(out_width)
+        out_height = _make_even(out_height)
+
+        actual_output_ratio = output_ratio if output_ratio is not None else split_ratio
+
+        # 边界保护：所有 crop 滤镜参数必须 ≥ 2，否则 FFmpeg 报错
+        if out_width < 2 or out_height < 2:
+            raise ValueError(
+                f"输出尺寸过小({out_width}x{out_height})，无法构建透明通道滤镜"
+            )
+        if target_scaled_width < 2 or target_scaled_height < 2:
+            raise ValueError(
+                f"列表视频缩放后尺寸过小({target_scaled_width}x{target_scaled_height})，"
+                f"请调高缩放百分比或增大输出尺寸"
+            )
+
+        # 构建缩放滤镜
+        template_scale = _build_scale_filter(out_width, out_height, template_scale_mode)
+        list_scale = _build_scale_filter(out_width, out_height, list_scale_mode)
+
+        # 确定前景和背景
+        # 模板视频有透明通道，应该作为前景叠加在列表视频上
+        swap_order = (position_order == "list_first")
+
+        if swap_order:
+            # 列表视频在前景，模板视频在背景（不常见，但支持）
+            bg_scale = list_scale
+            fg_scale = template_scale
+            bg_input = "1:v"
+            fg_input = "0:v"
+        else:
+            # 模板视频在前景（透明部分会显示背景），列表视频在背景
+            bg_scale = list_scale
+            fg_scale = template_scale
+            bg_input = "1:v"
+            fg_input = "0:v"
+
+        # 计算裁剪区域
+        if split_mode == self.SPLIT_HORIZONTAL:
+            # 水平分割
+            part_width = _make_even(int(out_width * actual_output_ratio))
+
+            if merge_mode == self.MERGE_A_C:
+                # 使用左半部分
+                video_filter = (
+                    f"[{bg_input}]{bg_scale},setsar=1,crop={part_width}:{out_height}:0:0[bg];"
+                    f"[{fg_input}]{fg_scale},setsar=1,crop={part_width}:{out_height}:0:0[fg];"
+                    f"[bg][fg]overlay=0:0:format=yuv420[outv]"
+                )
+            elif merge_mode == self.MERGE_A_D:
+                # 模板左半 + 列表右半（列表右半没有透明通道，使用普通hstack）
+                list_part_width = _make_even(int(target_scaled_width * target_split_ratio))
+                bg_out_width = out_width - part_width
+                video_filter = (
+                    f"[{fg_input}]{fg_scale},crop={part_width}:{out_height}:0:0[fg];"
+                    f"[{bg_input}]scale={target_scaled_width}:{target_scaled_height}:force_original_aspect_ratio=disable,"
+                    f"crop={target_scaled_width - list_part_width}:{target_scaled_height}:{list_part_width}:0,"
+                    f"scale={bg_out_width}:{out_height}:force_original_aspect_ratio=disable[bg];"
+                    f"[fg][bg]hstack=inputs=2[outv]"
+                )
+            elif merge_mode == self.MERGE_B_C:
+                # 模板右半 + 列表左半
+                list_part_width = _make_even(int(target_scaled_width * target_split_ratio))
+                fg_out_width = out_width - part_width
+                video_filter = (
+                    f"[{fg_input}]{fg_scale},crop={out_width - part_width}:{out_height}:{part_width}:0,"
+                    f"scale={fg_out_width}:{out_height}:force_original_aspect_ratio=disable[fg];"
+                    f"[{bg_input}]scale={target_scaled_width}:{target_scaled_height}:force_original_aspect_ratio=disable,"
+                    f"crop={list_part_width}:{target_scaled_height}:0:0,"
+                    f"scale={part_width}:{out_height}:force_original_aspect_ratio=disable[bg];"
+                    f"[bg][fg]hstack=inputs=2[outv]"
+                )
+            elif merge_mode == self.MERGE_B_D:
+                # 使用右半部分
+                video_filter = (
+                    f"[{bg_input}]{bg_scale},setsar=1,crop={out_width - part_width}:{out_height}:{part_width}:0[bg];"
+                    f"[{fg_input}]{fg_scale},setsar=1,crop={out_width - part_width}:{out_height}:{part_width}:0[fg];"
+                    f"[bg][fg]overlay=0:0:format=yuv420[outv]"
+                )
+            else:
+                # GRID 模式：四个子块必须都满足 libx264 偶数要求
+                half_width = _make_even(out_width // 2)
+                half_height = _make_even(out_height // 2)
+                video_filter = (
+                    f"[{fg_input}]{fg_scale},crop={half_width}:{half_height}:0:0[tl];"
+                    f"[{fg_input}]{fg_scale},crop={half_width}:{half_height}:{half_width}:0[tr];"
+                    f"[{bg_input}]{bg_scale},crop={half_width}:{half_height}:0:0[bl];"
+                    f"[{bg_input}]{bg_scale},crop={half_width}:{half_height}:{half_width}:0[br];"
+                    f"[tl][tr]hstack=inputs=2[top];"
+                    f"[bl][br]hstack=inputs=2[bottom];"
+                    f"[top][bottom]vstack=inputs=2[outv]"
+                )
+        else:
+            # 垂直分割
+            part_height = _make_even(int(out_height * actual_output_ratio))
+
+            if merge_mode == self.MERGE_A_C:
+                # 使用上半部分
+                video_filter = (
+                    f"[{bg_input}]{bg_scale},setsar=1,crop={out_width}:{part_height}:0:0[bg];"
+                    f"[{fg_input}]{fg_scale},setsar=1,crop={out_width}:{part_height}:0:0[fg];"
+                    f"[bg][fg]overlay=0:0:format=yuv420[outv]"
+                )
+            elif merge_mode == self.MERGE_A_D:
+                list_part_height = _make_even(int(target_scaled_height * target_split_ratio))
+                bg_out_height = out_height - part_height
+                video_filter = (
+                    f"[{fg_input}]{fg_scale},crop={out_width}:{part_height}:0:0[fg];"
+                    f"[{bg_input}]scale={target_scaled_width}:{target_scaled_height}:force_original_aspect_ratio=disable,"
+                    f"crop={target_scaled_width}:{target_scaled_height - list_part_height}:0:{list_part_height},"
+                    f"scale={out_width}:{bg_out_height}:force_original_aspect_ratio=disable[bg];"
+                    f"[fg][bg]vstack=inputs=2[outv]"
+                )
+            elif merge_mode == self.MERGE_B_C:
+                list_part_height = _make_even(int(target_scaled_height * target_split_ratio))
+                fg_out_height = out_height - part_height
+                video_filter = (
+                    f"[{fg_input}]{fg_scale},crop={out_width}:{out_height - part_height}:0:{part_height},"
+                    f"scale={out_width}:{fg_out_height}:force_original_aspect_ratio=disable[fg];"
+                    f"[{bg_input}]scale={target_scaled_width}:{target_scaled_height}:force_original_aspect_ratio=disable,"
+                    f"crop={target_scaled_width}:{list_part_height}:0:0,"
+                    f"scale={out_width}:{part_height}:force_original_aspect_ratio=disable[bg];"
+                    f"[bg][fg]vstack=inputs=2[outv]"
+                )
+            elif merge_mode == self.MERGE_B_D:
+                video_filter = (
+                    f"[{bg_input}]{bg_scale},setsar=1,crop={out_width}:{out_height - part_height}:0:{part_height}[bg];"
+                    f"[{fg_input}]{fg_scale},setsar=1,crop={out_width}:{out_height - part_height}:0:{part_height}[fg];"
+                    f"[bg][fg]overlay=0:0:format=yuv420[outv]"
+                )
+            else:
+                # GRID 模式：四个子块必须都满足 libx264 偶数要求
+                half_width = _make_even(out_width // 2)
+                half_height = _make_even(out_height // 2)
+                video_filter = (
+                    f"[{fg_input}]{fg_scale},crop={half_width}:{half_height}:0:0[tl];"
+                    f"[{fg_input}]{fg_scale},crop={half_width}:{half_height}:0:{half_height}[tr];"
+                    f"[{bg_input}]{bg_scale},crop={half_width}:{half_height}:0:0[bl];"
+                    f"[{bg_input}]{bg_scale},crop={half_width}:{half_height}:0:{half_height}[br];"
+                    f"[tl][tr]hstack=inputs=2[top];"
+                    f"[bl][br]hstack=inputs=2[bottom];"
+                    f"[top][bottom]vstack=inputs=2[outv]"
+                )
+
+        if audio_filter:
+            return f"{video_filter};{audio_filter}"
+        return video_filter
+
+    def _build_filter_complex(
+        self,
+        split_mode: str,
+        merge_mode: str,
+        split_ratio: float,
+        target_split_ratio: float,
+        out_width: int,
+        out_height: int,
+        template_duration: float,
+        target_duration: float,
+        template_has_audio: bool = True,
+        target_has_audio: bool = True,
+        target_scale_percent: int = 100,
+        position_order: str = "template_first",
+        audio_source: str = "template",
+        scale_mode: str = "fit",
+        output_ratio: float = None,
+        template_scale_mode: str = "fit",
+        list_scale_mode: str = "fit",
+        template_volume: int = 100,
+        list_volume: int = 100
+    ) -> str:
+        """构建FFmpeg filter_complex字符串
+
+        Args:
+            output_ratio: 输出比例 - 上/左部分在输出中占的比例，None表示跟随split_ratio
+            template_scale_mode: 模板视频缩放模式 (fit/fill/stretch)
+            list_scale_mode: 列表视频缩放模式 (fit/fill/stretch)
+            template_volume: 模板音频音量百分比 (0-200)
+            list_volume: 列表音频音量百分比 (0-200)
+        """
+        logger.debug(f"缩放模式: 模板={template_scale_mode}, 列表={list_scale_mode}")
+        logger.debug(f"音量设置: 模板={template_volume}%, 列表={list_volume}%")
+
+        # 计算音量倍数
+        template_vol = template_volume / 100.0
+        list_vol = list_volume / 100.0
+
+        # 音频filter（带音量控制）
+        audio_filter = None
+        if audio_source == "mix":
+            if template_has_audio and target_has_audio:
+                audio_filter = f"[0:a]volume={template_vol}[a0];[1:a]volume={list_vol}[a1];[a0][a1]amix=inputs=2:duration=longest[outa]"
+            elif template_has_audio:
+                audio_filter = f"[0:a]volume={template_vol}[outa]"
+            elif target_has_audio:
+                audio_filter = f"[1:a]volume={list_vol}[outa]"
+        elif audio_source == "template":
+            if template_has_audio:
+                audio_filter = f"[0:a]volume={template_vol}[outa]"
+        elif audio_source == "list":
+            if target_has_audio:
+                audio_filter = f"[1:a]volume={list_vol}[outa]"
+
+        swap_order = (position_order == "list_first")
+        scale_factor = target_scale_percent / 100.0
+        # 确保所有尺寸是偶数（libx264要求）
+        target_scaled_width = _make_even(int(out_width * scale_factor))
+        target_scaled_height = _make_even(int(out_height * scale_factor))
+        out_width = _make_even(out_width)
+        out_height = _make_even(out_height)
+
+        # 使用 output_ratio 决定输出中各部分的大小，如果未指定则使用 split_ratio
+        actual_output_ratio = output_ratio if output_ratio is not None else split_ratio
+
+        if split_mode == self.SPLIT_HORIZONTAL:
+            # 输出中各部分的宽度（由 output_ratio 决定）
+            template_part_a_width = _make_even(int(out_width * actual_output_ratio))
+            template_part_b_width = out_width - template_part_a_width
+            # 从列表视频裁剪的区域（由 target_split_ratio 决定）
+            target_part_c_width = _make_even(int(target_scaled_width * target_split_ratio))
+            target_part_d_width = target_scaled_width - target_part_c_width
+
+            video_filter = self._build_horizontal_filter(
+                merge_mode, swap_order,
+                out_width, out_height,
+                template_part_a_width, template_part_b_width,
+                target_scaled_width, target_scaled_height,
+                target_part_c_width, target_part_d_width,
+                template_scale_mode, list_scale_mode
+            )
+        else:
+            # 输出中各部分的高度（由 output_ratio 决定）
+            template_part_a_height = _make_even(int(out_height * actual_output_ratio))
+            template_part_b_height = out_height - template_part_a_height
+            # 从列表视频裁剪的区域（由 target_split_ratio 决定）
+            target_part_c_height = _make_even(int(target_scaled_height * target_split_ratio))
+            target_part_d_height = target_scaled_height - target_part_c_height
+
+            video_filter = self._build_vertical_filter(
+                merge_mode, swap_order,
+                out_width, out_height,
+                template_part_a_height, template_part_b_height,
+                target_scaled_width, target_scaled_height,
+                target_part_c_height, target_part_d_height,
+                template_scale_mode, list_scale_mode
+            )
+
+        if audio_filter:
+            return f"{video_filter};{audio_filter}"
+        return video_filter
+
+    def _build_mask_filter_complex(
+        self,
+        out_width: int,
+        out_height: int,
+        template_has_audio: bool,
+        target_has_audio: bool,
+        position_order: str,
+        audio_source: str,
+        template_scale_mode: str,
+        list_scale_mode: str,
+        template_volume: int,
+        list_volume: int,
+        divider_color: str = "#FFFFFF",
+        divider_width: int = 0
+    ) -> str:
+        """构建基于蒙版的视频合成滤镜
+
+        使用蒙版图片将两个视频混合，实现曲线分界线效果。
+        蒙版中白色区域显示第一个视频，黑色区域显示第二个视频。
+
+        Args:
+            out_width: 输出宽度
+            out_height: 输出高度
+            template_has_audio: 模板是否有音频
+            target_has_audio: 目标是否有音频
+            position_order: 位置顺序
+            audio_source: 音频来源
+            template_scale_mode: 模板缩放模式
+            list_scale_mode: 列表缩放模式
+            template_volume: 模板音量
+            list_volume: 列表音量
+            divider_color: 分界线颜色
+            divider_width: 分界线宽度
+        """
+        template_vol = template_volume / 100.0
+        list_vol = list_volume / 100.0
+
+        # 音频filter
+        audio_filter = None
+        if audio_source == "mix":
+            if template_has_audio and target_has_audio:
+                audio_filter = f"[0:a]volume={template_vol}[a0];[1:a]volume={list_vol}[a1];[a0][a1]amix=inputs=2:duration=longest[outa]"
+            elif template_has_audio:
+                audio_filter = f"[0:a]volume={template_vol}[outa]"
+            elif target_has_audio:
+                audio_filter = f"[1:a]volume={list_vol}[outa]"
+        elif audio_source == "template":
+            if template_has_audio:
+                audio_filter = f"[0:a]volume={template_vol}[outa]"
+        elif audio_source == "list":
+            if target_has_audio:
+                audio_filter = f"[1:a]volume={list_vol}[outa]"
+
+        # 确定哪个视频在前景（通过蒙版显示），哪个在背景
+        swap_order = (position_order == "list_first")
+
+        # 构建缩放滤镜
+        template_scale = _build_scale_filter(out_width, out_height, template_scale_mode)
+        list_scale = _build_scale_filter(out_width, out_height, list_scale_mode)
+
+        if swap_order:
+            # 列表视频在前景（白色区域），模板视频在背景
+            fg_input = "1:v"
+            bg_input = "0:v"
+            fg_scale = list_scale
+            bg_scale = template_scale
+        else:
+            # 模板视频在前景（白色区域），列表视频在背景
+            fg_input = "0:v"
+            bg_input = "1:v"
+            fg_scale = template_scale
+            bg_scale = list_scale
+
+        # 视频滤镜：
+        # 1. 缩放两个视频到输出尺寸
+        # 2. 将蒙版缩放到输出尺寸并转换为alpha通道
+        # 3. 使用alphamerge将蒙版应用到前景视频
+        # 4. 使用overlay将前景视频叠加到背景视频上
+
+        # 如果有分界线宽度，需要在蒙版边缘绘制线条
+        if divider_width > 0:
+            # 使用边缘检测创建分界线效果
+            # 将分界线宽度转换为蒙版线条的阈值
+            # 注意：split后原始标签被消费，需要分成3份用于不同用途
+            video_filter = (
+                f"[{fg_input}]{fg_scale}[fg];"
+                f"[{bg_input}]{bg_scale}[bg];"
+                # 缩放蒙版并分成3份：用于边缘检测(2份)和alphamerge(1份)
+                f"[2:v]scale={out_width}:{out_height},format=gray,split=3[mask1][mask2][mask3];"
+                # 创建分界线：通过膨胀检测边缘，然后增强边缘使其更明显
+                f"[mask1]erosion=threshold0={divider_width}:threshold1={divider_width}:threshold2={divider_width}:threshold3={divider_width}[eroded];"
+                f"[mask2][eroded]blend=all_expr='if(gt(A,B),255,0)'[edge];"
+                # 使用mask3进行视频合并，edge用于分界线显示
+                f"[fg][mask3]alphamerge[fg_alpha];"
+                f"[bg][fg_alpha]overlay=0:0[merged];"
+                f"[merged][edge]overlay=0:0[outv]"
+            )
+        else:
+            video_filter = (
+                f"[{fg_input}]{fg_scale}[fg];"
+                f"[{bg_input}]{bg_scale}[bg];"
+                f"[2:v]scale={out_width}:{out_height},format=gray[mask];"
+                f"[fg][mask]alphamerge[fg_alpha];"
+                f"[bg][fg_alpha]overlay=0:0[outv]"
+            )
+
+        if audio_filter:
+            return f"{video_filter};{audio_filter}"
+        return video_filter
+
+    def _build_horizontal_filter(
+        self, merge_mode: str, swap_order: bool,
+        out_width: int, out_height: int,
+        part_a_width: int, part_b_width: int,
+        target_width: int, target_height: int,
+        part_c_width: int, part_d_width: int,
+        template_scale_mode: str = "fit",
+        list_scale_mode: str = "fit"
+    ) -> str:
+        """构建水平分割滤镜"""
+        # 验证所有尺寸参数为正数，防止FFmpeg crop滤镜报错
+        dims = {
+            'out_width': out_width, 'out_height': out_height,
+            'part_a_width': part_a_width, 'part_b_width': part_b_width,
+            'target_width': target_width, 'target_height': target_height,
+            'part_c_width': part_c_width, 'part_d_width': part_d_width
+        }
+        for name, val in dims.items():
+            if val < 2:
+                raise ValueError(f"滤镜参数{name}={val}过小（最小需要2px），请调整分割比例或输出尺寸")
+
+        # 验证部分之和不超过总宽度
+        if part_a_width + part_b_width > out_width or part_c_width + part_d_width > target_width:
+            raise ValueError(
+                f"滤镜参数不合法：裁剪区域宽度超出范围 "
+                f"(A+B={part_a_width + part_b_width}/{out_width}, C+D={part_c_width + part_d_width}/{target_width})"
+            )
+
+        # 计算安全偏移量（确保不为负数）
+        cb_offset = max(0, target_width - part_d_width)
+        tb_offset = max(0, out_width - part_b_width)
+        t_scale_left = _build_scale_filter(part_a_width, out_height, template_scale_mode)
+        t_scale_right = _build_scale_filter(part_b_width, out_height, template_scale_mode)
+        l_scale_left = _build_scale_filter(part_a_width, out_height, list_scale_mode)
+        l_scale_right = _build_scale_filter(part_b_width, out_height, list_scale_mode)
+
+        if merge_mode == self.MERGE_A_C:
+            if swap_order:
+                # 列表C在左，模板A在右
+                return (
+                    f"[1:v]scale={target_width}:{target_height}:force_original_aspect_ratio=disable,"
+                    f"crop={part_c_width}:{target_height}:0:0,"
+                    f"{l_scale_left}[vc];"
+                    f"[0:v]scale={out_width}:{out_height}:force_original_aspect_ratio=disable,"
+                    f"crop={part_a_width}:{out_height}:0:0,"
+                    f"{t_scale_right}[va];"
+                    f"[vc][va]hstack=inputs=2[outv]"
+                )
+            else:
+                # 模板A在左，列表C在右
+                return (
+                    f"[0:v]scale={out_width}:{out_height}:force_original_aspect_ratio=disable,"
+                    f"crop={part_a_width}:{out_height}:0:0,"
+                    f"{t_scale_left}[va];"
+                    f"[1:v]scale={target_width}:{target_height}:force_original_aspect_ratio=disable,"
+                    f"crop={part_c_width}:{target_height}:0:0,"
+                    f"{l_scale_right}[vc];"
+                    f"[va][vc]hstack=inputs=2[outv]"
+                )
+        elif merge_mode == self.MERGE_A_D:
+            if swap_order:
+                # 列表D在左，模板A在右
+                return (
+                    f"[1:v]scale={target_width}:{target_height}:force_original_aspect_ratio=disable,"
+                    f"crop={part_d_width}:{target_height}:{cb_offset}:0,"
+                    f"{l_scale_left}[vd];"
+                    f"[0:v]scale={out_width}:{out_height}:force_original_aspect_ratio=disable,"
+                    f"crop={part_a_width}:{out_height}:0:0,"
+                    f"{t_scale_right}[va];"
+                    f"[vd][va]hstack=inputs=2[outv]"
+                )
+            else:
+                # 模板A在左，列表D在右
+                return (
+                    f"[0:v]scale={out_width}:{out_height}:force_original_aspect_ratio=disable,"
+                    f"crop={part_a_width}:{out_height}:0:0,"
+                    f"{t_scale_left}[va];"
+                    f"[1:v]scale={target_width}:{target_height}:force_original_aspect_ratio=disable,"
+                    f"crop={part_d_width}:{target_height}:{cb_offset}:0,"
+                    f"{l_scale_right}[vd];"
+                    f"[va][vd]hstack=inputs=2[outv]"
+                )
+        elif merge_mode == self.MERGE_B_C:
+            if swap_order:
+                # 列表C在左，模板B在右
+                return (
+                    f"[1:v]scale={target_width}:{target_height}:force_original_aspect_ratio=disable,"
+                    f"crop={part_c_width}:{target_height}:0:0,"
+                    f"{l_scale_left}[vc];"
+                    f"[0:v]scale={out_width}:{out_height}:force_original_aspect_ratio=disable,"
+                    f"crop={part_b_width}:{out_height}:{tb_offset}:0,"
+                    f"{t_scale_right}[vb];"
+                    f"[vc][vb]hstack=inputs=2[outv]"
+                )
+            else:
+                # 模板B在左，列表C在右
+                return (
+                    f"[0:v]scale={out_width}:{out_height}:force_original_aspect_ratio=disable,"
+                    f"crop={part_b_width}:{out_height}:{tb_offset}:0,"
+                    f"{t_scale_left}[vb];"
+                    f"[1:v]scale={target_width}:{target_height}:force_original_aspect_ratio=disable,"
+                    f"crop={part_c_width}:{target_height}:0:0,"
+                    f"{l_scale_right}[vc];"
+                    f"[vb][vc]hstack=inputs=2[outv]"
+                )
+        elif merge_mode == self.MERGE_B_D:
+            if swap_order:
+                # 列表D在左，模板B在右
+                return (
+                    f"[1:v]scale={target_width}:{target_height}:force_original_aspect_ratio=disable,"
+                    f"crop={part_d_width}:{target_height}:{cb_offset}:0,"
+                    f"{l_scale_left}[vd];"
+                    f"[0:v]scale={out_width}:{out_height}:force_original_aspect_ratio=disable,"
+                    f"crop={part_b_width}:{out_height}:{tb_offset}:0,"
+                    f"{t_scale_right}[vb];"
+                    f"[vd][vb]hstack=inputs=2[outv]"
+                )
+            else:
+                # 模板B在左，列表D在右
+                return (
+                    f"[0:v]scale={out_width}:{out_height}:force_original_aspect_ratio=disable,"
+                    f"crop={part_b_width}:{out_height}:{tb_offset}:0,"
+                    f"{t_scale_left}[vb];"
+                    f"[1:v]scale={target_width}:{target_height}:force_original_aspect_ratio=disable,"
+                    f"crop={part_d_width}:{target_height}:{cb_offset}:0,"
+                    f"{l_scale_right}[vd];"
+                    f"[vb][vd]hstack=inputs=2[outv]"
+                )
+        elif merge_mode == self.MERGE_GRID:
+            # GRID 模式：四个子块必须都满足 libx264 偶数要求，避免 ffmpeg crop 失败
+            half_width = _make_even(out_width // 2)
+            half_height = _make_even(out_height // 2)
+            return (
+                f"[0:v]scale={out_width}:{out_height}:force_original_aspect_ratio=disable,"
+                f"crop={part_a_width}:{out_height}:0:0,scale={half_width}:{half_height}[va];"
+                f"[0:v]scale={out_width}:{out_height}:force_original_aspect_ratio=disable,"
+                f"crop={part_b_width}:{out_height}:{tb_offset}:0,scale={half_width}:{half_height}[vb];"
+                f"[1:v]scale={target_width}:{target_height}:force_original_aspect_ratio=disable,"
+                f"crop={part_c_width}:{target_height}:0:0,scale={half_width}:{half_height}[vc];"
+                f"[1:v]scale={target_width}:{target_height}:force_original_aspect_ratio=disable,"
+                f"crop={part_d_width}:{target_height}:{cb_offset}:0,scale={half_width}:{half_height}[vd];"
+                f"[va][vb]hstack=inputs=2[top];"
+                f"[vc][vd]hstack=inputs=2[bottom];"
+                f"[top][bottom]vstack=inputs=2[outv]"
+            )
+        else:
+            raise ValueError(f"未知的拼接方式: {merge_mode}")
+
+    def _build_vertical_filter(
+        self, merge_mode: str, swap_order: bool,
+        out_width: int, out_height: int,
+        part_a_height: int, part_b_height: int,
+        target_width: int, target_height: int,
+        part_c_height: int, part_d_height: int,
+        template_scale_mode: str = "fit",
+        list_scale_mode: str = "fit"
+    ) -> str:
+        """构建垂直分割滤镜"""
+        # 验证所有尺寸参数为正数，防止FFmpeg crop滤镜报错
+        dims = {
+            'out_width': out_width, 'out_height': out_height,
+            'part_a_height': part_a_height, 'part_b_height': part_b_height,
+            'target_width': target_width, 'target_height': target_height,
+            'part_c_height': part_c_height, 'part_d_height': part_d_height
+        }
+        for name, val in dims.items():
+            if val < 2:
+                raise ValueError(f"滤镜参数{name}={val}过小（最小需要2px），请调整分割比例或输出尺寸")
+
+        # 验证部分之和不超过总高度
+        if part_a_height + part_b_height > out_height or part_c_height + part_d_height > target_height:
+            raise ValueError(
+                f"滤镜参数不合法：裁剪区域高度超出范围 "
+                f"(A+B={part_a_height + part_b_height}/{out_height}, C+D={part_c_height + part_d_height}/{target_height})"
+            )
+
+        # 计算安全偏移量（确保不为负数）
+        cd_offset = max(0, target_height - part_d_height)
+        tb_offset = max(0, out_height - part_b_height)
+        t_scale_top = _build_scale_filter(out_width, part_a_height, template_scale_mode)
+        t_scale_bottom = _build_scale_filter(out_width, part_b_height, template_scale_mode)
+        l_scale_top = _build_scale_filter(out_width, part_a_height, list_scale_mode)
+        l_scale_bottom = _build_scale_filter(out_width, part_b_height, list_scale_mode)
+
+        if merge_mode == self.MERGE_A_C:
+            if swap_order:
+                # 列表C在上，模板A在下
+                return (
+                    f"[1:v]scale={target_width}:{target_height}:force_original_aspect_ratio=disable,"
+                    f"crop={target_width}:{part_c_height}:0:0,"
+                    f"{l_scale_top}[vc];"
+                    f"[0:v]scale={out_width}:{out_height}:force_original_aspect_ratio=disable,"
+                    f"crop={out_width}:{part_a_height}:0:0,"
+                    f"{t_scale_bottom}[va];"
+                    f"[vc][va]vstack=inputs=2[outv]"
+                )
+            else:
+                # 模板A在上，列表C在下
+                return (
+                    f"[0:v]scale={out_width}:{out_height}:force_original_aspect_ratio=disable,"
+                    f"crop={out_width}:{part_a_height}:0:0,"
+                    f"{t_scale_top}[va];"
+                    f"[1:v]scale={target_width}:{target_height}:force_original_aspect_ratio=disable,"
+                    f"crop={target_width}:{part_c_height}:0:0,"
+                    f"{l_scale_bottom}[vc];"
+                    f"[va][vc]vstack=inputs=2[outv]"
+                )
+        elif merge_mode == self.MERGE_A_D:
+            if swap_order:
+                # 列表D在上，模板A在下
+                return (
+                    f"[1:v]scale={target_width}:{target_height}:force_original_aspect_ratio=disable,"
+                    f"crop={target_width}:{part_d_height}:0:{cd_offset},"
+                    f"{l_scale_top}[vd];"
+                    f"[0:v]scale={out_width}:{out_height}:force_original_aspect_ratio=disable,"
+                    f"crop={out_width}:{part_a_height}:0:0,"
+                    f"{t_scale_bottom}[va];"
+                    f"[vd][va]vstack=inputs=2[outv]"
+                )
+            else:
+                # 模板A在上，列表D在下
+                return (
+                    f"[0:v]scale={out_width}:{out_height}:force_original_aspect_ratio=disable,"
+                    f"crop={out_width}:{part_a_height}:0:0,"
+                    f"{t_scale_top}[va];"
+                    f"[1:v]scale={target_width}:{target_height}:force_original_aspect_ratio=disable,"
+                    f"crop={target_width}:{part_d_height}:0:{cd_offset},"
+                    f"{l_scale_bottom}[vd];"
+                    f"[va][vd]vstack=inputs=2[outv]"
+                )
+        elif merge_mode == self.MERGE_B_C:
+            if swap_order:
+                # 列表C在上，模板B在下
+                return (
+                    f"[1:v]scale={target_width}:{target_height}:force_original_aspect_ratio=disable,"
+                    f"crop={target_width}:{part_c_height}:0:0,"
+                    f"{l_scale_top}[vc];"
+                    f"[0:v]scale={out_width}:{out_height}:force_original_aspect_ratio=disable,"
+                    f"crop={out_width}:{part_b_height}:0:{tb_offset},"
+                    f"{t_scale_bottom}[vb];"
+                    f"[vc][vb]vstack=inputs=2[outv]"
+                )
+            else:
+                # 模板B在上，列表C在下
+                return (
+                    f"[0:v]scale={out_width}:{out_height}:force_original_aspect_ratio=disable,"
+                    f"crop={out_width}:{part_b_height}:0:{tb_offset},"
+                    f"{t_scale_top}[vb];"
+                    f"[1:v]scale={target_width}:{target_height}:force_original_aspect_ratio=disable,"
+                    f"crop={target_width}:{part_c_height}:0:0,"
+                    f"{l_scale_bottom}[vc];"
+                    f"[vb][vc]vstack=inputs=2[outv]"
+                )
+        elif merge_mode == self.MERGE_B_D:
+            if swap_order:
+                # 列表D在上，模板B在下
+                return (
+                    f"[1:v]scale={target_width}:{target_height}:force_original_aspect_ratio=disable,"
+                    f"crop={target_width}:{part_d_height}:0:{cd_offset},"
+                    f"{l_scale_top}[vd];"
+                    f"[0:v]scale={out_width}:{out_height}:force_original_aspect_ratio=disable,"
+                    f"crop={out_width}:{part_b_height}:0:{tb_offset},"
+                    f"{t_scale_bottom}[vb];"
+                    f"[vd][vb]vstack=inputs=2[outv]"
+                )
+            else:
+                # 模板B在上，列表D在下
+                return (
+                    f"[0:v]scale={out_width}:{out_height}:force_original_aspect_ratio=disable,"
+                    f"crop={out_width}:{part_b_height}:0:{tb_offset},"
+                    f"{t_scale_top}[vb];"
+                    f"[1:v]scale={target_width}:{target_height}:force_original_aspect_ratio=disable,"
+                    f"crop={target_width}:{part_d_height}:0:{cd_offset},"
+                    f"{l_scale_bottom}[vd];"
+                    f"[vb][vd]vstack=inputs=2[outv]"
+                )
+        elif merge_mode == self.MERGE_GRID:
+            # GRID 模式：四个子块必须都满足 libx264 偶数要求，避免 ffmpeg crop 失败
+            half_width = _make_even(out_width // 2)
+            half_height = _make_even(out_height // 2)
+            return (
+                f"[0:v]scale={out_width}:{out_height}:force_original_aspect_ratio=disable,"
+                f"crop={out_width}:{part_a_height}:0:0,scale={half_width}:{half_height}[va];"
+                f"[0:v]scale={out_width}:{out_height}:force_original_aspect_ratio=disable,"
+                f"crop={out_width}:{part_b_height}:0:{tb_offset},scale={half_width}:{half_height}[vb];"
+                f"[1:v]scale={target_width}:{target_height}:force_original_aspect_ratio=disable,"
+                f"crop={target_width}:{part_c_height}:0:0,scale={half_width}:{half_height}[vc];"
+                f"[1:v]scale={target_width}:{target_height}:force_original_aspect_ratio=disable,"
+                f"crop={target_width}:{part_d_height}:0:{cd_offset},scale={half_width}:{half_height}[vd];"
+                f"[va][vb]hstack=inputs=2[top];"
+                f"[vc][vd]hstack=inputs=2[bottom];"
+                f"[top][bottom]vstack=inputs=2[outv]"
+            )
+        else:
+            raise ValueError(f"未知的拼接方式: {merge_mode}")

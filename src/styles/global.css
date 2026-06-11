@@ -1,0 +1,197 @@
+/* 全局样式 - 复古电影工作室主题（Cinematic Studio）
+   配色方向：温暖米色画布 + 砖红强调 + 青绿点缀
+   避免通用 AI slop 美学（紫渐变 / 全黑） */
+:root {
+  /* 背景层级 */
+  --bg-canvas: #F5F1EA;        /* 应用主背景：温暖米色 */
+  --bg-surface: #FFFFFF;       /* 卡片表面：纯白浮于米色 */
+  --bg-elevated: #FAF7F1;      /* 浮层 / hover */
+  --bg-sider: #EDE7DA;         /* 侧边栏：略深米色 */
+  --bg-footer: #FFFFFF;        /* 底部状态栏：白色 */
+  --bg-code: #F0EBE0;          /* 代码/canvas 背景 */
+
+  /* 文字层级（深棕黑系，比纯黑柔和） */
+  --text-primary: #2D2A26;
+  --text-secondary: #5C5852;
+  --text-tertiary: #8A8580;
+  --text-disabled: #B5B0A8;
+  --text-inverse: #FFFFFF;     /* 按钮文字等深底场景 */
+
+  /* 边框 / 分割线 */
+  --border: #E0D9CC;
+  --border-strong: #C9C0AE;
+  --divider: #D6CFC1;
+
+  /* 强调色 */
+  --accent-primary: #C8553D;        /* 砖红/赤陶：主操作 */
+  --accent-primary-hover: #A84635;
+  --accent-primary-active: #8E3A2C;
+  --accent-secondary: #588B8B;      /* 柔和青绿：辅助 */
+  --accent-secondary-hover: #467576;
+  --accent-warm: #D4A24C;           /* 琥珀：B区标识、警告 */
+  --accent-warm-hover: #B5893C;
+
+  /* 状态色 */
+  --success: #6B8E4E;
+  --success-bg: #E8EFE0;
+  --warning: #D4A24C;
+  --warning-bg: #F5ECDA;
+  --error: #B54A4A;
+  --error-bg: #F2DEDE;
+  --info: #588B8B;
+  --info-bg: #E0E8E8;
+
+  /* 阴影 */
+  --shadow-sm: 0 1px 2px rgba(45, 42, 38, 0.06);
+  --shadow-md: 0 2px 8px rgba(45, 42, 38, 0.08);
+  --shadow-lg: 0 8px 24px rgba(45, 42, 38, 0.12);
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  background-color: var(--bg-canvas);
+  color: var(--text-primary);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial,
+    'Noto Sans', 'PingFang SC', 'Microsoft YaHei', sans-serif, 'Apple Color Emoji',
+    'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
+}
+
+/* 滚动条样式 - 配合浅色主题 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-tertiary);
+}
+
+/* 阻止 Electron 拖拽默认行为 */
+body {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* 可选中文字的区域 */
+.selectable {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* Ant Design 组件微调（覆盖默认 token 不足以触达的部分） */
+.ant-card {
+  background: var(--bg-surface) !important;
+  border-color: var(--border) !important;
+  box-shadow: var(--shadow-sm);
+}
+
+.ant-card-head {
+  border-bottom-color: var(--divider) !important;
+  color: var(--text-primary) !important;
+}
+
+.ant-card-head-title {
+  color: var(--text-primary) !important;
+  font-weight: 600;
+}
+
+.ant-table {
+  background: var(--bg-surface) !important;
+}
+
+.ant-table-thead > tr > th {
+  background: var(--bg-elevated) !important;
+  color: var(--text-secondary) !important;
+  border-bottom-color: var(--divider) !important;
+  font-weight: 600;
+}
+
+.ant-table-tbody > tr > td {
+  border-bottom-color: var(--divider) !important;
+}
+
+.ant-table-tbody > tr:hover > td {
+  background: var(--bg-elevated) !important;
+}
+
+.ant-modal-content {
+  background: var(--bg-surface) !important;
+}
+
+.ant-modal-header {
+  background: transparent !important;
+  border-bottom-color: var(--divider) !important;
+}
+
+/* Steps 组件适配 */
+.ant-steps-item-title {
+  color: var(--text-primary) !important;
+}
+
+.ant-steps-item-description {
+  color: var(--text-secondary) !important;
+}
+
+.ant-steps-item-finish .ant-steps-item-icon {
+  background: var(--accent-primary) !important;
+  border-color: var(--accent-primary) !important;
+}
+
+.ant-steps-item-finish .ant-steps-item-icon > .ant-steps-icon {
+  color: var(--text-inverse) !important;
+}
+
+.ant-steps-item-finish .ant-steps-item-title,
+.ant-steps-item-finish .ant-steps-item-description {
+  color: var(--text-primary) !important;
+}
+
+.ant-steps-item-process .ant-steps-item-icon {
+  background: var(--accent-primary) !important;
+  border-color: var(--accent-primary) !important;
+}
+
+.ant-steps-item-process .ant-steps-item-icon > .ant-steps-icon {
+  color: var(--text-inverse) !important;
+}
+
+.ant-steps-item-process .ant-steps-item-title {
+  color: var(--accent-primary) !important;
+  font-weight: 600;
+}
+
+/* 进度条适配 */
+.ant-progress-bg {
+  background: var(--accent-primary) !important;
+}
+
+/* Message 提示（虽然会自动适配，但确保颜色协调） */
+.ant-message-notice-content {
+  background: var(--bg-surface) !important;
+  color: var(--text-primary) !important;
+  box-shadow: var(--shadow-md) !important;
+  border: 1px solid var(--border);
+}
+
+/* 选中文字颜色 */
+::selection {
+  background: var(--accent-primary);
+  color: var(--text-inverse);
+}
