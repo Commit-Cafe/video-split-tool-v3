@@ -1,4 +1,4 @@
-/* 百分比滑块 - 矩形蓝色把手 + 浅灰轨道 */
+/* 百分比滑块 - 矩形蓝色把手 + 加粗可见轨道 */
 
 .percent-slider {
   display: flex;
@@ -16,7 +16,7 @@
 
 .percent-slider-track {
   flex: 1;
-  min-width: 0;
+  min-width: 140px;  /* 确保轨道有足够长度可拖动 */
 }
 
 .percent-slider-value {
@@ -28,15 +28,15 @@
   flex-shrink: 0;
 }
 
-/* 矩形把手（匹配设计图） */
+/* 矩形把手（匹配设计图）+ 加大尺寸让点击更稳 */
 .percent-slider .ant-slider-handle {
-  width: 6px;
-  height: 16px;
+  width: 8px;
+  height: 20px;
   border-radius: 2px;
   background: #1677FF;
   border: 2px solid #1677FF;
   box-shadow: none;
-  margin-top: -7px;
+  margin-top: -9px;
   transition: box-shadow .15s;
 }
 
@@ -53,12 +53,17 @@
   box-shadow: 0 0 0 5px rgba(22, 119, 255, 0.2);
 }
 
-.percent-slider .ant-slider-track {
-  background: #1677FF;
+/* 轨道加粗、加深：默认 antd 是 4px 灰，容易看不清 */
+.percent-slider .ant-slider-rail {
+  background: #BFBFBF;
+  height: 6px;
+  border-radius: 3px;
 }
 
-.percent-slider .ant-slider-rail {
-  background: #D9D9D9;
+.percent-slider .ant-slider-track {
+  background: #1677FF;
+  height: 6px;
+  border-radius: 3px;
 }
 
 .percent-slider-disabled {

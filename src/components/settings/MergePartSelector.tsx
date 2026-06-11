@@ -1,6 +1,7 @@
 /**
  * 拼接部分选择器
- * 2x2 网格：左/上 A/C，右/下 B/D；行=模板/列表
+ * 紧凑 2x2 网格：行=模板/列表，列=左/上 / 右/下
+ * 单元格只显示字母，行列标签在网格外
  */
 import { Typography } from 'antd';
 import { useMergeSettingsStore } from '@/store';
@@ -37,7 +38,7 @@ export default function MergePartSelector() {
           color: 'var(--text-secondary)',
           fontSize: 12,
           display: 'block',
-          marginBottom: 6,
+          marginBottom: 4,
         }}
       >
         选择拼接部分（至少 2 个）
@@ -45,81 +46,75 @@ export default function MergePartSelector() {
       <div
         style={{
           display: 'grid',
-          gridTemplateColumns: '1fr 1fr',
-          gap: 8,
+          gridTemplateColumns: '30px 1fr 1fr',
+          gap: 4,
+          alignItems: 'center',
+          maxWidth: 160,
         }}
       >
-        {cells.map((cell) => {
-          const active = cell.checked;
-          return (
-            <div
-              key={cell.key}
-              role="button"
-              tabIndex={0}
-              onClick={() => setUsePart(cell.key, !active)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === ' ') {
-                  e.preventDefault();
-                  setUsePart(cell.key, !active);
-                }
-              }}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 10,
-                padding: '8px 10px',
-                border: `1px solid ${active ? 'var(--accent-primary)' : 'var(--border)'}`,
-                borderRadius: 6,
-                background: active ? 'var(--bg-elevated)' : 'transparent',
-                cursor: 'pointer',
-                transition: 'border-color .15s, background .15s',
-                userSelect: 'none',
-              }}
-            >
-              <div
-                style={{
-                  width: 28,
-                  height: 28,
-                  borderRadius: 4,
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  background: active ? 'var(--accent-primary)' : 'var(--bg-canvas)',
-                  color: active ? '#fff' : 'var(--text-secondary)',
-                  fontWeight: 700,
-                  fontSize: 14,
-                  border: `1px solid ${active ? 'var(--accent-primary)' : 'var(--border)'}`,
-                  flexShrink: 0,
-                }}
-              >
-                {cell.key}
-              </div>
-              <div style={{ minWidth: 0 }}>
-                <div
-                  style={{
-                    color: 'var(--text-primary)',
-                    fontSize: 12,
-                    fontWeight: 500,
-                    lineHeight: 1.3,
-                  }}
-                >
-                  {cell.row}
-                </div>
-                <div
-                  style={{
-                    color: 'var(--text-tertiary)',
-                    fontSize: 10,
-                    lineHeight: 1.3,
-                    marginTop: 1,
-                  }}
-                >
-                  {cell.col}半
-                </div>
-              </div>
-            </div>
-          );
+        {/* 头部：左/上、右/下 */}
+        <div />
+        <div style={{ textAlign: 'center', fontSize: 10, color: 'var(--text-tertiary)' }}>
+          {leftLabel}
+        </div>
+        <div style={{ textAlign: 'center', fontSize: 10, color: 'var(--text-tertiary)' }}>
+          {rightLabel}
+        </div>
+
+        {/* 模板行：A B */}
+        <div style={{ fontSize: 10, color: 'var(--text-tertiary)' }}>模板</div>
+        {(['A', 'B'] as const).map((key) => {
+          const cell = cells.find((c) => c.key === key)!;
+          return <PartCellView key={key} cell={cell} onToggle={setUsePart} />;
+        })}
+
+        {/* 列表行：C D */}
+        <div style={{ fontSize: 10, color: 'var(--text-tertiary)' }}>列表</div>
+        {(['C', 'D'] as const).map((key) => {
+          const cell = cells.find((c) => c.key === key)!;
+          return <PartCellView key={key} cell={cell} onToggle={setUsePart} />;
         })}
       </div>
+    </div>
+  );
+}
+
+function PartCellView({
+  cell,
+  onToggle,
+}: {
+  cell: PartCell;
+  onToggle: (key: PartKey, value: boolean) => void;
+}) {
+  const active = cell.checked;
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={() => onToggle(cell.key, !active)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onToggle(cell.key, !active);
+        }
+      }}
+      style={{
+        aspectRatio: '1',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        border: `1px solid ${active ? 'var(--accent-primary)' : 'var(--border)'}`,
+        borderRadius: 4,
+        background: active ? 'var(--accent-primary)' : 'var(--bg-elevated)',
+        color: active ? '#fff' : 'var(--text-secondary)',
+        fontWeight: 700,
+        fontSize: 13,
+        cursor: 'pointer',
+        userSelect: 'none',
+        transition: 'border-color .15s, background .15s, color .15s',
+      }}
+    >
+      {cell.key}
     </div>
   );
 }
