@@ -1,6 +1,5 @@
 """
-视频处理适配器
-封装 core.VideoProcessor，适配异步调用和 WebSocket 进度推送
+视频处理适配器：封装 core.VideoProcessor，适配异步调用和 WebSocket 进度推送
 """
 import asyncio
 import logging
@@ -20,12 +19,22 @@ class VideoProcessorAdapter:
     将同步的 core.VideoProcessor 转换为异步任务，通过 WebSocket 推送进度
     """
 
-    def __init__(self):
+    def __init__(self, main_loop: Optional[asyncio.AbstractEventLoop] = None):
         self._cancel_flag = False
+        # 持有主事件循环的引用，供后台线程安全地调度协程
+        self._main_loop = main_loop
+
+    def set_main_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """主事件循环启动后注入（避免 Background 线程中 asyncio.get_event_loop 失败）"""
+        self._main_loop = loop
 
     def request_cancel(self):
         """请求取消当前处理"""
         self._cancel_flag = True
+
+    def is_cancelled(self) -> bool:
+        """查询是否已请求取消"""
+        return self._cancel_flag
 
     async def process_single_video(
         self,
@@ -36,7 +45,7 @@ class VideoProcessorAdapter:
         template_video: str,
         target_video: str,
         output_path: str,
-        # 分割/拼接参数
+        # 分割/合并参数
         split_mode: str = "horizontal",
         merge_mode: str = "a+c",
         split_ratio: float = 0.5,
@@ -48,7 +57,7 @@ class VideoProcessorAdapter:
         cover_image_path: str = None,
         cover_duration: float = 1.0,
         cover_frame_source: str = "template",
-        # 拼接
+        # 合并
         position_order: str = "template_first",
         # 音频
         audio_source: str = "template",
@@ -86,20 +95,16 @@ class VideoProcessorAdapter:
         self._cancel_flag = False
 
         def progress_callback(progress: float, message: str):
-            """进度回调 → WebSocket 广播"""
+            """进度回调 -> WebSocket 广播（线程安全）"""
             overall = ((item_index + progress) / total_items) * 100
-            # 同步发送 WebSocket 消息（在 asyncio 事件循环中调度）
-            try:
-                loop = asyncio.get_event_loop()
-                loop.create_task(ws_manager.broadcast({
-                    "type": "task_progress",
-                    "task_id": task_id,
-                    "item_index": item_index,
-                    "progress": round(overall, 1),
-                    "message": message,
-                }))
-            except RuntimeError:
-                pass  # 事件循环不可用时静默忽略
+            payload = {
+                "type": "task_progress",
+                "task_id": task_id,
+                "item_index": item_index,
+                "progress": round(overall, 1),
+                "message": message,
+            }
+            self._safe_broadcast(payload)
 
         def run_sync():
             """在线程池中执行同步处理"""
@@ -160,6 +165,30 @@ class VideoProcessorAdapter:
             "output_path": output_path if result.success else None,
         }
 
+    def _safe_broadcast(self, payload: dict) -> None:
+        """
+        线程安全地把 WebSocket 广播调度到主事件循环
+
+        关键点：在 run_in_executor 回调（worker 线程）中调用 ws_manager.broadcast()
+        是不安全的——worker 线程没有运行 asyncio 事件循环。必须通过
+        run_coroutine_threadsafe 把协程扔回主循环执行。
+        """
+        loop = self._main_loop
+        if loop is None or loop.is_closed():
+            # 退化路径：主循环还没注入或已关闭。退回到 try/except 静默忽略。
+            try:
+                asyncio.get_event_loop().create_task(ws_manager.broadcast(payload))
+            except RuntimeError:
+                pass
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                ws_manager.broadcast(payload),
+                loop,
+            )
+        except RuntimeError as e:
+            logger.warning(f"WebSocket 广播调度失败: {e}")
+
 
 def generate_output_filename(
     original_name: str,
@@ -170,7 +199,13 @@ def generate_output_filename(
 ) -> str:
     """
     生成输出文件名
-    命名规则与原项目一致，包含 PID + 时间戳避免冲突
+    命名规则与前端保持一致（含 PID + 时间戳避免冲突）
+
+    支持的命名规则（与 frontend/src/store/slices/outputSettingsSlice.ts 对齐）:
+      - timestamp          -> 20260305_142530_037_001.mp4
+      - original_merged    -> <name>_merged.mp4
+      - prefix_sequence    -> <prefix>_001.mp4
+      - original_timestamp -> <name>_20260305_142530.mp4
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     pid_tag = f"{os.getpid():05d}"
@@ -178,16 +213,31 @@ def generate_output_filename(
 
     if naming_rule == "timestamp":
         filename = f"{timestamp}_{pid_tag}_{ms_tag}_{index:03d}"
-    elif naming_rule == "prefix":
+    elif naming_rule == "original_merged":
+        base = original_name
+        if merge_mode_suffix:
+            base = f"{original_name}_{merge_mode_suffix}"
+        filename = f"{base}_merged"
+    elif naming_rule == "prefix_sequence":
+        prefix = custom_prefix or "video"
+        filename = f"{prefix}_{index:03d}"
+    elif naming_rule == "original_timestamp":
+        base = original_name
+        if merge_mode_suffix:
+            base = f"{original_name}_{merge_mode_suffix}"
+        filename = f"{base}_{timestamp}_{pid_tag}"
+    elif naming_rule in ("prefix", "sequence"):
+        # 向后兼容旧值
         prefix = custom_prefix or "video"
         filename = f"{prefix}_{pid_tag}_{ms_tag}_{index:03d}"
     elif naming_rule == "original":
+        # 向后兼容旧值
         base = original_name
         if merge_mode_suffix:
             base = f"{original_name}_{merge_mode_suffix}"
         filename = f"{base}_{timestamp}_{pid_tag}"
     else:
-        # 默认
+        # 未知规则：fallback 到 original
         base = original_name
         if merge_mode_suffix:
             base = f"{original_name}_{merge_mode_suffix}"
@@ -205,7 +255,6 @@ def get_merge_combinations(
 ) -> list[str]:
     """
     生成合并组合列表（笛卡尔积）
-    与原项目 _get_merge_combinations 逻辑一致
     """
     if process_mode == "overlay":
         return ["overlay"]

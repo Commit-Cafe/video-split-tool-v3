@@ -7,7 +7,7 @@ import sys
 import tempfile
 from typing import Set
 
-# 优先复用项目自身的 logger；构建日志系统时 logging 还没初始化，所以 fallback 到 logging
+# 优先复用项目自己的 logger；构建日志系统时 logging 还没初始化，所以 fallback 到 logging
 try:
     from .logger import logger as _logger
 except Exception:
@@ -20,10 +20,10 @@ def get_base_path() -> str:
     优先级：
       1. PyInstaller --onefile 模式：使用 sys._MEIPASS（解压后的资源目录）
       2. PyInstaller --onedir 模式：使用 sys.executable 同级目录
-      3. 开发模式：使用 src/ 目录的祖父目录（项目根）
+      3. 开发模式：使用 src/ 目录的祖级目录（项目根）
     """
     if getattr(sys, 'frozen', False):
-        # 1) 优先用 _MEIPASS（onefile 解压目录），里面通常有 ffmpeg 等资源
+        # 1) 优先用 _MEIPASS（onefile 解压目录），里面通常含 ffmpeg 等资源
         meipass = getattr(sys, '_MEIPASS', None)
         if meipass and os.path.isdir(meipass):
             return meipass
@@ -37,10 +37,13 @@ VALID_VIDEO_EXTENSIONS: Set[str] = {
     '.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v'
 }
 
+# 统一的临时目录名（与 backend/config.py 保持一致）
+TEMP_DIR_NAME = 'video_split_tool'
+
 
 def get_temp_dir() -> str:
     """获取临时目录"""
-    temp_dir = os.path.join(tempfile.gettempdir(), 'video_pin')
+    temp_dir = os.path.join(tempfile.gettempdir(), TEMP_DIR_NAME)
     os.makedirs(temp_dir, exist_ok=True)
     return temp_dir
 

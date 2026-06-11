@@ -1,7 +1,5 @@
 /**
- * 步骤条组件
- * 显示当前操作步骤，支持点击切换
- */
+ * 姝ラ鏉＄粍浠? * 鏄剧ず褰撳墠鎿嶄綔姝ラ锛屾敮鎸佺偣鍑诲垏鎹? */
 import { Steps } from 'antd';
 
 interface StepItem {
@@ -34,9 +32,7 @@ export default function StepBar({ steps, current, onChange }: StepBarProps) {
           </span>
         ),
       }))}
-      style={{
-        '--antd-arrow-size': '6px',
-      }}
+      style={{ '--antd-arrow-size': '6px' } as React.CSSProperties}
     />
   );
 }

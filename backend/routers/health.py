@@ -1,9 +1,9 @@
 """
-健康检查路由
-提供后端健康状态查询和优雅关闭接口
+健康检查路由：提供后端健康状态查询和优雅关闭接口
 """
 import logging
 import os
+import sys
 
 from fastapi import APIRouter
 
@@ -40,7 +40,8 @@ async def health_check():
         'version': '3.0.0',
         'ffmpeg_available': ffmpeg_available,
         'ffmpeg_path': ffmpeg_path,
-        'python_version': os.sys.version,
+        'python_version': sys.version,
+        'platform': sys.platform,
     }
 
 

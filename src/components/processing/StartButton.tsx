@@ -4,7 +4,7 @@
  * 开始处理 + 停止 是两个独立按钮：
  * - 未处理时：停止按钮 disabled
  * - 处理中：开始按钮 disabled，停止按钮可点击
- * - 处理完成：恢复初始状态（停止按钮仍 disabled）
+ * - 处理完成：恢复初始状态（停止按钮 disabled）
  */
 import { useCallback, useState } from 'react';
 import {
@@ -59,6 +59,11 @@ export default function StartButton() {
     setProgress({ total: items.length, completed: 0, failed: 0, currentProgress: 0, statusMessage: '提交任务...' });
 
     try {
+      // 决定 divider_mask_path：仅在启用分界线 + 有曲线控制点时传实际路径
+      const dividerMaskPath = divider.enabled && divider.curvePoints.length >= 2
+        ? (divider.maskPath || null)
+        : null;
+
       const config = {
         template_video: template,
         target_videos: items.map((item) => ({
@@ -97,7 +102,8 @@ export default function StartButton() {
         duration_mode: output.durationMode,
         naming_rule: output.namingRule,
         custom_prefix: output.customPrefix,
-        divider_mask_path: divider.enabled ? undefined : undefined,
+        // 修复 P0-2: 之前是 divider.enabled ? undefined : undefined
+        divider_mask_path: dividerMaskPath,
         divider_color: divider.color,
         divider_width: divider.width,
         logo_enabled: logo.enabled,
@@ -188,7 +194,7 @@ export default function StartButton() {
         />
       )}
 
-      {/* 状态文字 */}
+      {/* 状态文本 */}
       <Text style={{ color: 'var(--text-secondary)', fontSize: 12, minWidth: 100 }}>
         {isProcessing
           ? statusMessage

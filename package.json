@@ -1,17 +1,24 @@
 {
   "name": "video-split-tool-v3",
   "version": "3.0.0",
-  "description": "视频分割拼接工具 V3 - Electron + React + FastAPI",
+  "description": "Video Split Tool V3 - Electron + React + FastAPI",
   "main": "dist-electron/main.js",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "build:electron": "tsc -p tsconfig.electron.json",
     "build:web": "vite build",
+    "build:backend": "python build/build_backend.py --clean",
+    "download:ffmpeg": "python build/download_ffmpeg.py all",
     "preview": "vite preview",
     "electron:dev": "npm run build:electron && concurrently \"vite\" \"wait-on http://localhost:5173 && electron .\"",
     "electron:dev:watch": "tsc -p tsconfig.electron.json --watch",
     "electron:build": "npm run build:electron && vite build && electron-builder",
+    "dist": "npm run build:electron && npm run build:web && electron-builder",
+    "dist:win": "npm run build:backend && npm run download:ffmpeg && electron-builder --win",
+    "dist:mac": "npm run build:backend && npm run download:ffmpeg && electron-builder --mac",
+    "pack:win": "python build/build_installer.py --win",
+    "pack:mac": "python build/build_installer.py --mac",
     "lint": "eslint src --ext ts,tsx",
     "test": "vitest",
     "test:backend": "cd backend && python -m pytest"
@@ -45,12 +52,15 @@
     "files": [
       "dist/**/*",
       "dist-electron/**/*",
-      "backend/**/*",
-      "core/**/*",
-      "models/**/*",
-      "utils/**/*"
+      "dist-backend/**/*",
+      "build/**/*",
+      "package.json"
     ],
     "extraResources": [
+      {
+        "from": "dist-backend",
+        "to": "backend"
+      },
       {
         "from": "ffmpeg",
         "to": "ffmpeg"
@@ -63,7 +73,21 @@
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
+      "allowElevation": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "VideoSplitTool V3",
+      "deleteAppDataOnUninstall": true,
       "unicode": true
+    },
+    "mac": {
+      "target": ["dmg", "zip"],
+      "category": "public.app-category.video",
+      "icon": "public/icon.icns",
+      "identity": null,
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false
     }
   }
 }

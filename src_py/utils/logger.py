@@ -21,7 +21,7 @@ def setup_logger(name: str = "VideoSplitTool") -> logging.Logger:
     """
     log = logging.getLogger(name)
 
-    # 避免重复添加handler
+    # 避免重复添加 handler
     if log.handlers:
         return log
 
@@ -35,7 +35,7 @@ def setup_logger(name: str = "VideoSplitTool") -> logging.Logger:
     # 日志文件路径（按日期命名）
     log_file = os.path.join(log_dir, f'video_tool_{datetime.now().strftime("%Y%m%d")}.log')
 
-    # 文件处理器（记录所有级别，每条日志立即落盘防丢失）
+    # 文件处理器（记录所有级别，每条日志立即刷盘避免丢失）
     class FlushFileHandler(logging.FileHandler):
         def emit(self, record):
             super().emit(record)
@@ -61,13 +61,15 @@ def setup_logger(name: str = "VideoSplitTool") -> logging.Logger:
     return log
 
 
-def cleanup_old_logs(days: int = 7):
+def cleanup_old_logs(days: int = 7) -> None:
     """
     清理旧的日志文件
 
     Args:
-        days: 保留最近几天的日志，默认7天
+        days: 保留最近几天的日志，默认 7 天
     """
+    # 使用模块级 logger 而非 setup_logger() 内的局部变量
+    # setup_logger() 内的 log 变量在函数返回后即被销毁
     try:
         base_path = get_base_path()
         log_dir = os.path.join(base_path, 'logs')
@@ -85,6 +87,7 @@ def cleanup_old_logs(days: int = 7):
                     file_time = os.path.getmtime(file_path)
                     if file_time < cutoff_time:
                         os.remove(file_path)
+                        logger.info(f"已删除旧日志文件: {filename}")
                 except OSError as e:
                     logger.warning(f"无法删除旧日志文件 {filename}: {e}")
     except Exception as e:

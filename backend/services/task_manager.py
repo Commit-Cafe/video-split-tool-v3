@@ -1,6 +1,5 @@
 """
-后台任务管理器
-管理视频处理任务的队列、进度跟踪和并发控制
+后台任务管理器：管理视频处理任务的队列、进度跟踪和并发控制
 """
 import asyncio
 import logging
@@ -21,10 +20,17 @@ logger = logging.getLogger(__name__)
 class TaskManager:
     """后台任务管理器"""
 
+    # 最多保留多少已完成/已失败/已取消的任务元数据，防止长时间运行后内存膨胀
+    MAX_TASK_HISTORY = 100
+
     def __init__(self):
         self._tasks: dict = {}
         self._adapter = VideoProcessorAdapter()
         self._running_task_id: Optional[str] = None
+
+    def set_main_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """FastAPI 启动后注入主事件循环，使后台线程能安全调度协程"""
+        self._adapter.set_main_loop(loop)
 
     async def submit_task(self, config: dict) -> str:
         """
@@ -32,6 +38,9 @@ class TaskManager:
         启动后台协程处理视频列表
         """
         task_id = uuid.uuid4().hex[:12]
+
+        # 显式保存每任务的取消令牌——避免多任务共享布尔 flag 导致误取消
+        cancel_event = asyncio.Event()
 
         self._tasks[task_id] = {
             "status": "running",
@@ -41,17 +50,31 @@ class TaskManager:
             "failed": 0,
             "results": [],
             "config": config,
+            "cancel_event": cancel_event,
         }
 
         # 启动后台处理协程
-        asyncio.create_task(self._run_task(task_id, config))
+        asyncio.create_task(self._run_task(task_id, config, cancel_event))
 
         return task_id
 
-    async def _run_task(self, task_id: str, config: dict):
+    def _trim_history(self) -> None:
+        """裁剪历史任务，避免 _tasks 字典无限增长"""
+        # 仅保留运行中的任务 + 最近 N 个已完成任务
+        finished_ids = [
+            tid for tid, t in self._tasks.items()
+            if t.get("status") in ("completed", "failed", "cancelled")
+        ]
+        if len(finished_ids) > self.MAX_TASK_HISTORY:
+            finished_ids.sort(key=lambda tid: self._tasks[tid].get("_finished_at", 0))
+            for tid in finished_ids[: len(finished_ids) - self.MAX_TASK_HISTORY]:
+                self._tasks.pop(tid, None)
+                logger.debug(f"已清理旧任务记录: {tid}")
+
+    async def _run_task(self, task_id: str, config: dict, cancel_event: asyncio.Event):
         """
         执行完整的处理任务
-        对应原 _process_videos 的双重循环逻辑
+        对应原来 _process_videos 的双重循环逻辑
         """
         self._running_task_id = task_id
 
@@ -73,7 +96,7 @@ class TaskManager:
             )
 
             if not combinations:
-                await self._fail_task(task_id, "没有有效的合并组合，请至少勾选 2 个部分")
+                await self._fail_task(task_id, "没有有效的合并组合，请至少选中 2 个部位")
                 return
 
             # 构建任务列表
@@ -107,8 +130,8 @@ class TaskManager:
 
             for video_idx, video_item in enumerate(tasks):
                 for merge_mode in combinations:
-                    # 检查取消
-                    if self._tasks[task_id]["status"] == "cancelled":
+                    # 检查本任务是否已被取消（不依赖共享布尔 flag）
+                    if cancel_event.is_set() or self._tasks[task_id]["status"] == "cancelled":
                         await ws_manager.broadcast({
                             "type": "task_cancelled",
                             "task_id": task_id,
@@ -122,7 +145,7 @@ class TaskManager:
                     output_filename = generate_output_filename(
                         original_name=base_name,
                         index=video_idx + 1,
-                        naming_rule=config.get("naming_rule", "original"),
+                        naming_rule=config.get("naming_rule", "original_timestamp"),
                         custom_prefix=config.get("custom_prefix", "video"),
                         merge_mode_suffix=merge_suffix,
                     )
@@ -135,6 +158,20 @@ class TaskManager:
                         "level": "info",
                         "message": f"[{item_index + 1}/{total_items}] 处理: {task_desc}",
                     })
+
+                    # 解析封面图片路径（处理 None 和空字符串）
+                    cover_image_path = video_item.get("cover_image_path")
+                    if not cover_image_path:
+                        cover_image_path = None
+                    else:
+                        cover_image_path = str(cover_image_path).strip() or None
+                    # 封面类型为 image 时，图片路径必填，否则强制降级到 frame
+                    effective_cover_type = video_item.get("cover_type", "none")
+                    if effective_cover_type == "image" and not cover_image_path:
+                        effective_cover_type = "frame"
+                        logger.warning(
+                            f"封面类型为 image 但未提供图片路径，降级为 frame: {video_path}"
+                        )
 
                     # 执行处理
                     try:
@@ -150,9 +187,9 @@ class TaskManager:
                             split_ratio=video_item.get("split_ratio", config.get("split_ratio", 0.5)),
                             target_split_ratio=video_item.get("split_ratio"),
                             target_scale_percent=video_item.get("scale_percent", 100),
-                            cover_type=video_item.get("cover_type", config.get("cover_type", "none")),
+                            cover_type=effective_cover_type,
                             cover_frame_time=video_item.get("cover_frame_time", config.get("cover_frame_time", 0)),
-                            cover_image_path=video_item.get("cover_image_path"),
+                            cover_image_path=cover_image_path,
                             cover_duration=video_item.get("cover_duration", config.get("cover_duration", 1.0)),
                             cover_frame_source=video_item.get("cover_frame_source", "template"),
                             position_order=config.get("position_order", "template_first"),
@@ -227,6 +264,7 @@ class TaskManager:
             self._tasks[task_id]["status"] = "completed"
             self._tasks[task_id]["results"] = results
             self._tasks[task_id]["progress"] = 100
+            self._tasks[task_id]["_finished_at"] = asyncio.get_event_loop().time()
 
             await ws_manager.broadcast({
                 "type": "task_complete",
@@ -242,8 +280,16 @@ class TaskManager:
                            + (f", 失败 {fail_count}" if fail_count > 0 else ""),
             })
 
+            # 清理历史
+            self._trim_history()
+
+        except asyncio.CancelledError:
+            logger.info(f"任务 {task_id} 已被取消")
+            self._tasks[task_id]["status"] = "cancelled"
+            self._tasks[task_id]["_finished_at"] = asyncio.get_event_loop().time()
+            raise
         except Exception as e:
-            logger.error(f"任务 {task_id} 异常: {e}")
+            logger.exception(f"任务 {task_id} 异常: {e}")
             await self._fail_task(task_id, str(e))
         finally:
             self._running_task_id = None
@@ -251,6 +297,7 @@ class TaskManager:
     async def _fail_task(self, task_id: str, error: str):
         """标记任务失败"""
         self._tasks[task_id]["status"] = "failed"
+        self._tasks[task_id]["_finished_at"] = asyncio.get_event_loop().time()
         await ws_manager.broadcast({
             "type": "log",
             "level": "error",
@@ -264,19 +311,24 @@ class TaskManager:
         })
 
     async def cancel_task(self, task_id: str) -> bool:
-        """取消任务"""
+        """取消任务（精确到单个任务的 Event，不影响其他任务）"""
         if task_id not in self._tasks:
             return False
         if self._tasks[task_id]["status"] != "running":
             return False
 
         self._tasks[task_id]["status"] = "cancelled"
+        # 触发本任务专属的取消事件
+        cancel_event: asyncio.Event = self._tasks[task_id].get("cancel_event")
+        if cancel_event is not None:
+            cancel_event.set()
+        # 同时通知 adapter 尽快停止当前 worker 循环
         self._adapter.request_cancel()
         return True
 
     def get_task_status(self, task_id: str) -> dict:
-        """获取任务状态"""
-        return self._tasks.get(task_id, {
+        """获取任务状态（去掉内部字段）"""
+        task = self._tasks.get(task_id, {
             "status": "unknown",
             "progress": 0,
             "total": 0,
@@ -284,6 +336,14 @@ class TaskManager:
             "failed": 0,
             "results": [],
         })
+        return {
+            "status": task.get("status", "unknown"),
+            "progress": task.get("progress", 0),
+            "total": task.get("total", 0),
+            "completed": task.get("completed", 0),
+            "failed": task.get("failed", 0),
+            "results": task.get("results", []),
+        }
 
 
 # 全局任务管理器实例

@@ -6,10 +6,9 @@ import App from './App';
 import './styles/global.css';
 
 /**
- * 主题：复古电影工作室（Cinematic Studio）
- * 主色：砖红赤陶 #C8553D
- * 强调：青绿 #588B8B、琥珀 #D4A24C
- * 中性背景：温暖米色 + 白色卡片
+ * 涓婚锛氬鍙ょ數褰卞伐浣滃锛圕inematic Studio锛? * 涓昏壊锛氱爾绾㈣丹闄?#C8553D
+ * 寮鸿皟锛氶潚缁?#588B8B銆佺惀鐝€ #D4A24C
+ * 涓€ц儗鏅細娓╂殩绫宠壊 + 鐧借壊鍗＄墖
  */
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
@@ -18,8 +17,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
       theme={{
         algorithm: theme.defaultAlgorithm,
         token: {
-          // 主色：砖红赤陶
-          colorPrimary: '#C8553D',
+          // 涓昏壊锛氱爾绾㈣丹闄?          colorPrimary: '#C8553D',
           colorPrimaryHover: '#A84635',
           colorPrimaryActive: '#8E3A2C',
           colorPrimaryBg: '#FBEEEA',
@@ -29,24 +27,24 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
           colorPrimaryTextHover: '#C8553D',
           colorPrimaryTextActive: '#8E3A2C',
 
-          // 信息/次强调：青绿
+          // 淇℃伅/娆″己璋冿細闈掔豢
           colorInfo: '#588B8B',
           colorInfoHover: '#467576',
           colorInfoBg: '#E0E8E8',
 
-          // 成功
+          // 鎴愬姛
           colorSuccess: '#6B8E4E',
           colorSuccessBg: '#E8EFE0',
 
-          // 警告
+          // 璀﹀憡
           colorWarning: '#D4A24C',
           colorWarningBg: '#F5ECDA',
 
-          // 错误
+          // 閿欒
           colorError: '#B54A4A',
           colorErrorBg: '#F2DEDE',
 
-          // 文字
+          // 鏂囧瓧
           colorText: '#2D2A26',
           colorTextSecondary: '#5C5852',
           colorTextTertiary: '#8A8580',
@@ -57,34 +55,34 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
           colorTextLabel: '#5C5852',
           colorTextDisabled: '#B5B0A8',
 
-          // 背景
+          // 鑳屾櫙
           colorBgContainer: '#FFFFFF',
           colorBgElevated: '#FAF7F1',
           colorBgLayout: '#F5F1EA',
           colorBgSpotlight: '#FFFFFF',
           colorBgMask: 'rgba(45, 42, 38, 0.45)',
 
-          // 边框
+          // 杈规
           colorBorder: '#E0D9CC',
           colorBorderSecondary: '#EDE7DA',
           colorSplit: '#D6CFC1',
 
-          // 形状
+          // 褰㈢姸
           borderRadius: 6,
           borderRadiusLG: 8,
           borderRadiusSM: 4,
 
-          // 字体
+          // 瀛椾綋
           fontFamily:
             "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'PingFang SC', 'Microsoft YaHei', sans-serif",
           fontSize: 14,
 
-          // 控件
+          // 鎺т欢
           controlHeight: 32,
           controlHeightSM: 24,
           controlHeightLG: 40,
 
-          // 阴影
+          // 闃村奖
           boxShadow:
             '0 1px 2px 0 rgba(45, 42, 38, 0.06), 0 1px 6px -1px rgba(45, 42, 38, 0.08), 0 2px 4px 0 rgba(45, 42, 38, 0.04)',
           boxShadowSecondary:
@@ -174,7 +172,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
           Radio: {
             colorPrimary: '#C8553D',
             buttonCheckedBg: '#FBEEEA',
-            buttonCheckedColor: '#A84635',
+            buttonSolidCheckedColor: '#A84635',
             buttonColor: '#5C5852',
           },
           Checkbox: {

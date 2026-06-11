@@ -8,6 +8,17 @@ export interface HealthInfo {
   version: string;
   ffmpeg_available: boolean;
   ffmpeg_path?: string;
+  python_version?: string;
+  platform?: string;
+}
+
+/** 后端 VideoInfoData 响应结构（与 backend/schemas/video.py 对齐） */
+export interface VideoInfoData {
+  width: number;
+  height: number;
+  duration: number;
+  has_audio: boolean;
+  has_alpha: boolean;
 }
 
 /** 视频元数据信息 */
@@ -62,8 +73,12 @@ export type OutputSizeMode = 'template' | 'list' | 'custom';
 /** 封面类型 */
 export type CoverType = 'none' | 'frame' | 'image';
 
-/** 命名规则 */
-export type NamingRule = 'original' | 'prefix' | 'sequence' | 'timestamp';
+/** 命名规则（与 backend/schemas/task.py 保持一致） */
+export type NamingRule =
+  | 'timestamp'          // 时间戳优先：20260305_142530_037_001
+  | 'original_merged'    // 原始名 + _merged
+  | 'prefix_sequence'    // 自定义前缀 + 序号
+  | 'original_timestamp'; // 原始名 + 时间戳
 
 /** WebSocket 事件类型 */
 export type WsEventType =

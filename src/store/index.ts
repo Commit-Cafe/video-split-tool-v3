@@ -2,7 +2,7 @@
  * Zustand Store 统一导出
  */
 export { useTemplateStore } from './slices/templateSlice';
-export { useVideoListStore } from './slices/videoListSlice';
+export { useVideoListStore, type VideoListItem } from './slices/videoListSlice';
 export { useMergeSettingsStore } from './slices/mergeSettingsSlice';
 export { useOutputSettingsStore } from './slices/outputSettingsSlice';
 export { useAudioSettingsStore } from './slices/audioSettingsSlice';

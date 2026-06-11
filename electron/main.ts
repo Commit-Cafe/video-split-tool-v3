@@ -11,6 +11,10 @@ import { registerIpcHandlers } from './ipc';
 
 let mainWindow: BrowserWindow | null = null;
 let backendPort: number = 18000;
+// 防止 before-quit / window-all-closed 重复调用 cleanup()
+let isQuitting = false;
+// 防止重复启动 bootstrap
+let bootstrapStarted = false;
 
 /**
  * 创建主窗口
@@ -33,13 +37,26 @@ function createWindow(port: number) {
     },
   });
 
+  // 把后端端口注入到 window.__BACKEND_PORT__，供前端 fetch / WebSocket 使用
+  mainWindow.webContents.on('did-finish-load', () => {
+    if (mainWindow) {
+      mainWindow.webContents.executeJavaScript(
+        `window.__BACKEND_PORT__ = ${port};`
+      ).catch((e) => console.error('[Main] 注入后端端口失败:', e));
+    }
+  });
+
   // 开发模式：加载 Vite 开发服务器
   if (process.env.NODE_ENV === 'development') {
-    mainWindow.loadURL('http://localhost:5173');
+    mainWindow.loadURL('http://localhost:5173').catch((err) => {
+      console.error('[Main] 加载开发服务器失败:', err);
+    });
     mainWindow.webContents.openDevTools({ mode: 'detach' });
   } else {
     // 生产模式：加载打包后的文件
-    mainWindow.loadFile(path.join(__dirname, '../dist/index.html'));
+    mainWindow.loadFile(path.join(__dirname, '../dist/index.html')).catch((err) => {
+      console.error('[Main] 加载 index.html 失败:', err);
+    });
   }
 
   mainWindow.on('closed', () => {
@@ -51,6 +68,9 @@ function createWindow(port: number) {
  * 应用启动主流程
  */
 async function bootstrap() {
+  if (bootstrapStarted) return;
+  bootstrapStarted = true;
+
   console.log('[Main] 正在启动 VideoSplitTool V3...');
 
   // 1. 发现 FFmpeg 二进制文件
@@ -58,7 +78,7 @@ async function bootstrap() {
   console.log(`[Main] FFmpeg 路径: ${ffmpegPath || '未找到（将使用系统 PATH）'}`);
 
   // 2. 启动 FastAPI 后端。如果失败（Python 找不到 / 进程立即退出），
-  //    这里会抛错。直接终止启动流程，避免后续误连到旧僵尸后端。
+  //    这里会抛错。直接终止启动流程，避免后续连到旧版后端。
   try {
     backendPort = await startBackend(ffmpegPath);
   } catch (err: any) {
@@ -95,39 +115,71 @@ async function bootstrap() {
   // 5. 创建窗口
   createWindow(backendPort);
 
-  // 6. 注入后端端口到渲染进程
-  mainWindow?.webContents.executeJavaScript(
-    `window.__BACKEND_PORT__ = ${backendPort};`
-  );
-
   console.log('[Main] 启动完成');
 }
 
 /**
- * 应用退出清理
+ * 应用退出清理（只执行一次）
  */
 async function cleanup() {
+  if (isQuitting) return;
+  isQuitting = true;
   console.log('[Main] 正在清理...');
-  await stopBackend();
+  try {
+    await stopBackend();
+  } catch (e) {
+    console.error('[Main] stopBackend 出错:', e);
+  }
   mainWindow = null;
 }
 
-// Electron 生命周期
-app.whenReady().then(bootstrap);
-
-app.on('window-all-closed', async () => {
-  await cleanup();
+// 渲染进程崩溃：弹窗提示，避免静默失败
+app.on('render-process-gone', (_event, webContents, details) => {
+  console.error('[Main] 渲染进程异常退出:', details);
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    dialog.showErrorBox(
+      '渲染进程崩溃',
+      `渲染进程已退出（原因: ${details.reason}, code: ${details.exitCode}）。\n` +
+        '应用将退出，请重启程序。',
+    );
+  }
   app.quit();
 });
 
-app.on('before-quit', async (event) => {
-  event.preventDefault();
-  await cleanup();
+// Electron 生命周期
+app.whenReady().then(bootstrap).catch((err) => {
+  console.error('[Main] bootstrap 异常:', err);
   app.quit();
+});
+
+// 单实例锁：第二次启动时聚焦到已有窗口
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+}
+
+app.on('window-all-closed', () => {
+  // 在 Windows / Linux 上，所有窗口关闭时退出
+  cleanup().finally(() => app.quit());
+});
+
+app.on('before-quit', (event) => {
+  // 阻止 Electron 默认退出，等 cleanup 完成再放行
+  if (!isQuitting) {
+    event.preventDefault();
+    cleanup().finally(() => app.quit());
+  }
 });
 
 app.on('activate', () => {
-  if (mainWindow === null) {
+  if (mainWindow === null && backendPort) {
     createWindow(backendPort);
   }
 });

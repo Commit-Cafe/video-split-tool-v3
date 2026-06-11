@@ -5,6 +5,7 @@
 import logging
 import os
 import subprocess
+import sys
 
 from fastapi import APIRouter, HTTPException
 
@@ -32,7 +33,7 @@ async def check_ffmpeg():
         )
         if result.returncode == 0:
             available = True
-            # 解析版本号（第一行通常包含版本信息）
+            # 解析版本号(第一行通常包含版本信息)
             first_line = result.stdout.split('\n')[0]
             version = first_line.strip()
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -53,13 +54,16 @@ async def open_in_explorer(req: OpenInExplorerRequest):
 
     try:
         if os.name == 'nt':
-            os.startfile(req.path)  # noqa: S606
-        elif os.name == 'posix':
-            subprocess.run(['open' if sys.platform == 'darwin' else 'xdg-open', req.path])
+            # Windows: 使用 os.startfile 打开资源管理器并定位文件/目录
+            if os.path.isfile(req.path):
+                # 文件: 用 /select 高亮显示
+                subprocess.run(['explorer', '/select,', os.path.normpath(req.path)])
+            else:
+                os.startfile(req.path)  # noqa: S606
+        elif sys.platform == 'darwin':
+            subprocess.run(['open', req.path])
+        else:
+            subprocess.run(['xdg-open', req.path])
         return {'success': True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-# 需要导入 sys
-import sys

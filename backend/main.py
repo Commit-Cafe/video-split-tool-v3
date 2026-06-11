@@ -25,6 +25,8 @@ from backend.routers import health, video, config as config_router, file as file
 from backend.routers import task as task_router
 from backend.routers import preview as preview_router
 from backend.websocket.manager import ws_manager
+from backend.services.task_manager import task_manager
+from src_py.utils.file_utils import TEMP_DIR_NAME
 
 # 配置日志
 logging.basicConfig(
@@ -47,6 +49,10 @@ async def lifespan(app: FastAPI):
     temp_mgr.cleanup_old_temp_files(days=3)
     logger.info("旧临时文件清理完成")
 
+    # 注入主事件循环给 task_manager，使其后台线程能安全调度协程
+    main_loop = asyncio.get_event_loop()
+    task_manager.set_main_loop(main_loop)
+
     yield
 
     # 关闭时清理
@@ -64,11 +70,21 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # CORS 配置（允许浏览器和 Electron 渲染进程访问）
+    # CORS 配置
+    # 注意：CORS 规范要求 allow_credentials=True 时不能使用 allow_origins=['*']
+    # Electron 桌面应用通过本地 HTTP 调用，没有跨域问题；保留宽松策略仅供 web 开发用
+    is_dev = os.environ.get('VIDEO_SPLIT_TOOL_ENV', 'production') == 'development'
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=['*'],
-        allow_credentials=True,
+        allow_origins=['*'] if is_dev else [
+            'http://localhost:5173',
+            'http://127.0.0.1:5173',
+            'http://localhost:18000',
+            'http://127.0.0.1:18000',
+            'app://.',  # Electron file protocol
+        ],
+        # credentials 必须为 False 以兼容 wildcard origins
+        allow_credentials=False if is_dev else False,
         allow_methods=['*'],
         allow_headers=['*'],
     )
@@ -85,8 +101,8 @@ def create_app() -> FastAPI:
     from backend.websocket.progress import websocket_endpoint
     app.add_api_websocket_route('/ws/progress', websocket_endpoint)
 
-    # 静态文件服务（预览图片）
-    temp_dir = os.path.join(os.environ.get('TEMP', '/tmp'), 'video_split_tool')
+    # 静态文件服务（预览图片）—— 使用统一的临时目录名
+    temp_dir = os.path.join(os.environ.get('TEMP', '/tmp'), TEMP_DIR_NAME)
     os.makedirs(temp_dir, exist_ok=True)
     app.mount('/api/preview/image', StaticFiles(directory=temp_dir), name='preview_images')
 

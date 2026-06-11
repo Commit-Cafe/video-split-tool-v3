@@ -4,8 +4,8 @@
  */
 import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
-import * as http from 'http';
 import * as net from 'net';
+import { app } from 'electron';
 
 let backendProcess: ChildProcess | null = null;
 
@@ -37,7 +37,7 @@ async function findAvailablePort(start: number, maxTries: number = 100): Promise
 }
 
 /**
- * 把 PATH 中明显无关的项剥掉（hermes / WindowsApps 之类），
+ * 把 PATH 中明显无关的项滤掉（hermes / WindowsApps 之类），
  * 然后追加几个常见的 Python 安装位置。
  */
 function buildEnvPath(): string {
@@ -71,19 +71,13 @@ function buildEnvPath(): string {
 
 /**
  * 找到一个能正常运行的 Python 解释器，返回**绝对路径**。
- *
- * 这样调用方在 spawn 时就不需要依赖 PATH——Electron 主进程的 PATH
- * 经常缺 `%LOCALAPPDATA%\Programs\Python\Launcher`，直接 spawn `py` 会 ENOENT。
- *
- * Windows 上常用：`py`（Python Launcher）/ `python` / `python3`。
- * Linux/macOS：通常 `python3` 才有，`python` 经常是 2.x。
  */
 async function getPythonPath(): Promise<string> {
   const candidates = process.platform === 'win32'
     ? ['py', 'python', 'python3']
     : ['python3', 'python'];
 
-  console.log(`[Backend] 探测 Python 解释器 (候选: ${candidates.join(', ')})`);
+  console.log(`[Backend] 探测 Python 解释器（候选：${candidates.join(', ')}）`);
 
   for (const cmd of candidates) {
     const abs = await findPythonAbs(cmd);
@@ -102,7 +96,6 @@ async function getPythonPath(): Promise<string> {
 
 /**
  * 找到某个命令对应的绝对路径，并验证它能跑 `--version`。
- * 返回绝对路径或 null。
  */
 function findPythonAbs(cmd: string): Promise<string | null> {
   return new Promise((resolve) => {
@@ -132,7 +125,7 @@ function findPythonAbs(cmd: string): Promise<string | null> {
 
     findAbs().then((abs) => {
       if (!abs) {
-        console.log(`[Backend]   probe: ${cmd} → where 找不到任何匹配`);
+        console.log(`[Backend]   probe: ${cmd} → where 找不到任何匹配项`);
         return resolve(null);
       }
       // 2) 验证可执行
@@ -161,15 +154,54 @@ function findPythonAbs(cmd: string): Promise<string | null> {
 }
 
 /**
- * 获取后端入口文件路径
+ * 判断当前是否在开发模式
  */
-function getBackendPath(): string {
-  const isDev = process.env.NODE_ENV === 'development';
+function isDevMode(): boolean {
+  return process.env.NODE_ENV === 'development' || !app.isPackaged;
+}
+
+/**
+ * 解析项目根目录
+ *
+ * 开发模式：spawn.js 运行时位于 <root>/dist-electron/backend/，所以 __dirname 向上两级 = 项目根
+ * 生产模式：用 exe 所在目录
+ */
+function getProjectRoot(): string {
+  const isDev = isDevMode();
   if (isDev) {
-    return path.join(__dirname, '..', 'backend', 'main.py');
+    // __dirname = <root>/dist-electron/backend -> 向上两级到 <root>
+    return path.join(__dirname, '..', '..');
   }
-  // 生产环境：使用 PyInstaller 打包的后端可执行文件
-  return path.join(process.resourcesPath, 'backend', 'main.exe');
+  return path.dirname(app.getPath('exe'));
+}
+
+/**
+ * 获取后端启动命令
+ *
+ * - 开发模式：cwd = 项目根（使 `python -m backend.main` 能找到 backend/ 目录）
+ * - 生产模式：cwd = PyInstaller onedir 的 exe 同级目录
+ */
+function getBackendCommand(): { command: string; baseArgs: string[]; cwd: string } {
+  const isDev = isDevMode();
+
+  if (isDev) {
+    // 开发模式：python -m backend.main（在项目根执行）
+    return {
+      command: '', // 占位，实际在 startBackend 里 await getPythonPath()
+      baseArgs: ['-m', 'backend.main'],
+      cwd: getProjectRoot(),
+    };
+  }
+
+  // 生产模式：直接 spawn dist-backend/main(.exe)
+  const exeName = process.platform === 'win32' ? 'main.exe' : 'main';
+  const backendPath = path.join(process.resourcesPath, 'backend', exeName);
+  return {
+    command: backendPath,
+    baseArgs: [],
+    // PyInstaller onedir 模式下，exe 同级目录就是 cwd
+    cwd: path.dirname(backendPath),
+  };
 }
 
 /**
@@ -178,37 +210,37 @@ function getBackendPath(): string {
  * @returns 后端服务的端口号
  */
 export async function startBackend(ffmpegPath: string | null): Promise<number> {
-  // 找到可用端口（这里会顺带排除上次残留的进程占着的端口）
+  // 找到可用端口（这里会顺带排除上次残留的进程占用的端口）
   const port = await findAvailablePort(18000);
-  const backendPath = getBackendPath();
-  const pythonPath = await getPythonPath(); // 现在可能抛错
+  const backendCmd = getBackendCommand();
 
-  const isDev = process.env.NODE_ENV === 'development';
+  const isDev = isDevMode();
+  // 开发模式才需要探测 Python；生产模式直接用打包好的 exe
+  const command = isDev ? await getPythonPath() : backendCmd.command;
 
-  const args: string[] = [];
-  if (isDev) {
-    // 开发模式：python -m backend.main
-    args.push('-m', 'backend.main');
-  }
+  const args: string[] = [...backendCmd.baseArgs];
   args.push('--port', String(port));
   if (ffmpegPath) {
     args.push('--ffmpeg-path', ffmpegPath);
   }
 
-  console.log(`[Backend] 启动命令: ${pythonPath} ${args.join(' ')}`);
-
-  const cwd = isDev
-    ? path.join(__dirname, '..')
-    : path.dirname(backendPath);
+  console.log(`[Backend] 启动命令: ${command} ${args.join(' ')}`);
+  console.log(`[Backend] 工作目录: ${backendCmd.cwd}`);
 
   // 真正启动子进程
-  const child = spawn(pythonPath, args, {
-    cwd,
-    env: {
-      ...process.env,
-      PYTHONIOENCODING: 'utf-8',
-      PYTHONUNBUFFERED: '1',
-    },
+  // 关键修复：开发模式下显式把项目根加到 PYTHONPATH，确保 import 路径正确
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    PYTHONIOENCODING: 'utf-8',
+    PYTHONUNBUFFERED: '1',
+  };
+  if (isDev) {
+    env.PYTHONPATH = backendCmd.cwd + (process.platform === 'win32' ? ';' : ':') + (env.PYTHONPATH || '');
+  }
+
+  const child = spawn(command, args, {
+    cwd: backendCmd.cwd,
+    env,
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
   });
@@ -241,11 +273,11 @@ export async function startBackend(ffmpegPath: string | null): Promise<number> {
     lines.forEach((line) => console.error(`[Backend:ERR] ${line}`));
   });
 
-  // 短暂等待以捕获"启动即失败"的情况（ENOENT 等会很快通过 'error' 事件触发）
+  // 短暂等待以捕获一启动就失败的情况（ENOENT 等会很快通过 'error' 事件触发）
   await new Promise((r) => setTimeout(r, 500));
   if (spawnError || (exited && !backendProcess)) {
     backendProcess = null;
-    throw spawnError || new Error(`Python 进程已退出，未能在端口 ${port} 启动后端`);
+    throw spawnError || new Error(`后端进程已退出，未能在端口 ${port} 启动后端`);
   }
 
   return port;

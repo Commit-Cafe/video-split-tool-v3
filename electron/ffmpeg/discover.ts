@@ -22,22 +22,36 @@ function findInPath(dir: string, name: string): string | null {
 }
 
 /**
+ * 获取应用根目录（dev / prod 一致）
+ *
+ * - dev: __dirname 形如 <project>/dist-electron/electron/ffmpeg，向上两级到项目根
+ * - prod: 用 exe 所在目录
+ */
+function getAppBasePath(): string {
+  const isDev = !app.isPackaged;
+  if (isDev) {
+    // dist-electron/electron/ffmpeg/discover.js (运行时位置)
+    //   -> dist-electron/electron/ffmpeg
+    //   -> dist-electron/electron
+    //   -> dist-electron
+    //   -> project root
+    return path.join(__dirname, '..', '..', '..');
+  }
+  return path.dirname(app.getPath('exe'));
+}
+
+/**
  * 查找 FFmpeg 和 FFprobe 二进制文件
- * 查找策略（与原项目一致）：
+ * 查找策略（按优先级）：
  * 1. <app_path>/ffmpeg/bin/ffmpeg.exe
- * 2. <app_path>/ffmpeg-*\/bin/ffmpeg.exe
+ * 2. <app_path>/ffmpeg-*<suffix>/bin/ffmpeg.exe
  * 3. System PATH (returns null; Python backend will search)
  */
 export function discoverFfmpeg(): string | null {
   const platform = process.platform;
   const ffmpegName = platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
 
-  // 获取应用根目录
-  const isDev = process.env.NODE_ENV === 'development';
-  const basePath = isDev
-    ? path.join(__dirname, '..', '..')
-    : path.dirname(app.getPath('exe'));
-
+  const basePath = getAppBasePath();
   console.log(`[FFmpeg] 搜索根目录: ${basePath}`);
 
   // 策略 1: ffmpeg/bin/ffmpeg.exe
@@ -47,7 +61,7 @@ export function discoverFfmpeg(): string | null {
     return path.dirname(localPath);
   }
 
-  // 策略 2: ffmpeg-*/bin/ffmpeg.exe（带版本号目录）
+  // 策略 2: ffmpeg-*<suffix>/bin/ffmpeg.exe（带版本号目录）
   try {
     const entries = fs.readdirSync(basePath);
     const ffmpegDir = entries.find(
@@ -64,7 +78,7 @@ export function discoverFfmpeg(): string | null {
     // 忽略目录读取错误
   }
 
-  // 策略 3: 系统 PATH — 由 Python 端处理
+  // 策略 3: 系统 PATH —— 由 Python 端处理
   console.log('[FFmpeg] 本地未找到，将使用系统 PATH');
   return null;
 }
