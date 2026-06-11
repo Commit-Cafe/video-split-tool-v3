@@ -47,7 +47,8 @@ function createWindow(port: number) {
   });
 
   // 开发模式：加载 Vite 开发服务器
-  if (process.env.NODE_ENV === 'development') {
+  // 关键修复：用 !app.isPackaged 判断（dev 模式下 NODE_ENV 不会被自动设置）
+  if (!app.isPackaged) {
     mainWindow.loadURL('http://localhost:5173').catch((err) => {
       console.error('[Main] 加载开发服务器失败:', err);
     });
