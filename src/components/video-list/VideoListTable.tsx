@@ -180,7 +180,7 @@ export default function VideoListTable() {
   ];
 
   return (
-    <div style={{ paddingBottom: 16 }}>
+    <div style={{ paddingBottom: 16, minHeight: 540 }}>
       <Space style={{ marginBottom: 8 }}>
         <Button
           type="primary"
@@ -217,7 +217,7 @@ export default function VideoListTable() {
         rowKey="id"
         size="small"
         pagination={false}
-        scroll={{ y: 240 }}
+        scroll={{ y: 480 }}
         rowSelection={{
           selectedRowKeys: selectedIds,
           onChange: (keys) => setSelectedIds(keys as string[]),

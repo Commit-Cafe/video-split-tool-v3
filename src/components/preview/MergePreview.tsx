@@ -32,7 +32,7 @@ export default function MergePreview() {
 
     setLoading(true);
     try {
-      const url = await generatePreview({
+      const response = await generatePreview({
         template_video: videoPath,
         list_video: null,
         split_mode: splitMode,
@@ -57,7 +57,7 @@ export default function MergePreview() {
       });
 
       const port = window.__BACKEND_PORT__ || 18000;
-      setPreviewUrl(`http://localhost:${port}${url}`);
+      setPreviewUrl(`http://localhost:${port}${response.preview_url}`);
     } catch (err: any) {
       message.error(`预览生成失败: ${err.message}`);
     } finally {

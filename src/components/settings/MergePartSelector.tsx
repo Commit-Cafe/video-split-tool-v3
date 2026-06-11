@@ -1,51 +1,125 @@
 /**
- * 合并部分选择器
- * 勾选 A/B/C/D 四个部分组合 + 四宫格
+ * 拼接部分选择器
+ * 2x2 网格：左/上 A/C，右/下 B/D；行=模板/列表
  */
-import { Checkbox, Space, Typography, Row, Col } from 'antd';
+import { Typography } from 'antd';
 import { useMergeSettingsStore } from '@/store';
 
 const { Text } = Typography;
 
-const PART_LABELS: Record<string, { label: string; desc: string }> = {
-  A: { label: 'A', desc: '模板 左/上' },
-  B: { label: 'B', desc: '模板 右/下' },
-  C: { label: 'C', desc: '列表 左/上' },
-  D: { label: 'D', desc: '列表 右/下' },
-};
+type PartKey = 'A' | 'B' | 'C' | 'D';
+interface PartCell {
+  key: PartKey;
+  row: '模板' | '列表';
+  col: '左' | '上' | '右' | '下';
+  checked: boolean;
+}
 
 export default function MergePartSelector() {
   const { usePartA, usePartB, usePartC, usePartD, setUsePart, splitMode } =
     useMergeSettingsStore();
 
-  const dir = splitMode === 'horizontal' ? '左右' : '上下';
-  const partA = `${dir === '左右' ? '左' : '上'}半`;
-  const partB = `${dir === '左右' ? '右' : '下'}半`;
+  const isHorizontal = splitMode === 'horizontal';
+  const leftLabel = isHorizontal ? '左' : '上';
+  const rightLabel = isHorizontal ? '右' : '下';
 
-  const parts = [
-    { key: 'A' as const, checked: usePartA, label: `模板 ${partA}` },
-    { key: 'B' as const, checked: usePartB, label: `模板 ${partB}` },
-    { key: 'C' as const, checked: usePartC, label: `列表 ${partA}` },
-    { key: 'D' as const, checked: usePartD, label: `列表 ${partB}` },
+  const cells: PartCell[] = [
+    { key: 'A', row: '模板', col: leftLabel,  checked: usePartA },
+    { key: 'B', row: '模板', col: rightLabel, checked: usePartB },
+    { key: 'C', row: '列表', col: leftLabel,  checked: usePartC },
+    { key: 'D', row: '列表', col: rightLabel, checked: usePartD },
   ];
 
   return (
     <div style={{ marginBottom: 8 }}>
-      <Text style={{ color: 'var(--text-secondary)', fontSize: 12, display: 'block', marginBottom: 4 }}>
-        选择拼接部分（至少选 2 个）
+      <Text
+        style={{
+          color: 'var(--text-secondary)',
+          fontSize: 12,
+          display: 'block',
+          marginBottom: 6,
+        }}
+      >
+        选择拼接部分（至少 2 个）
       </Text>
-      <Row gutter={[8, 4]}>
-        {parts.map((p) => (
-          <Col key={p.key} span={12}>
-            <Checkbox
-              checked={p.checked}
-              onChange={(e) => setUsePart(p.key, e.target.checked)}
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: '1fr 1fr',
+          gap: 8,
+        }}
+      >
+        {cells.map((cell) => {
+          const active = cell.checked;
+          return (
+            <div
+              key={cell.key}
+              role="button"
+              tabIndex={0}
+              onClick={() => setUsePart(cell.key, !active)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  setUsePart(cell.key, !active);
+                }
+              }}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 10,
+                padding: '8px 10px',
+                border: `1px solid ${active ? 'var(--accent-primary)' : 'var(--border)'}`,
+                borderRadius: 6,
+                background: active ? 'var(--bg-elevated)' : 'transparent',
+                cursor: 'pointer',
+                transition: 'border-color .15s, background .15s',
+                userSelect: 'none',
+              }}
             >
-              <Text style={{ color: 'var(--text-primary)', fontSize: 12 }}>{p.label}</Text>
-            </Checkbox>
-          </Col>
-        ))}
-      </Row>
+              <div
+                style={{
+                  width: 28,
+                  height: 28,
+                  borderRadius: 4,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  background: active ? 'var(--accent-primary)' : 'var(--bg-canvas)',
+                  color: active ? '#fff' : 'var(--text-secondary)',
+                  fontWeight: 700,
+                  fontSize: 14,
+                  border: `1px solid ${active ? 'var(--accent-primary)' : 'var(--border)'}`,
+                  flexShrink: 0,
+                }}
+              >
+                {cell.key}
+              </div>
+              <div style={{ minWidth: 0 }}>
+                <div
+                  style={{
+                    color: 'var(--text-primary)',
+                    fontSize: 12,
+                    fontWeight: 500,
+                    lineHeight: 1.3,
+                  }}
+                >
+                  {cell.row}
+                </div>
+                <div
+                  style={{
+                    color: 'var(--text-tertiary)',
+                    fontSize: 10,
+                    lineHeight: 1.3,
+                    marginTop: 1,
+                  }}
+                >
+                  {cell.col}半
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }

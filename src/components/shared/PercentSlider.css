@@ -1,0 +1,67 @@
+/* 百分比滑块 - 矩形蓝色把手 + 浅灰轨道 */
+
+.percent-slider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+
+.percent-slider-label {
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.percent-slider-track {
+  flex: 1;
+  min-width: 0;
+}
+
+.percent-slider-value {
+  color: var(--text-primary);
+  font-size: 12px;
+  min-width: 42px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+/* 矩形把手（匹配设计图） */
+.percent-slider .ant-slider-handle {
+  width: 6px;
+  height: 16px;
+  border-radius: 2px;
+  background: #1677FF;
+  border: 2px solid #1677FF;
+  box-shadow: none;
+  margin-top: -7px;
+  transition: box-shadow .15s;
+}
+
+.percent-slider .ant-slider-handle::after {
+  display: none;
+}
+
+.percent-slider .ant-slider-handle:hover,
+.percent-slider .ant-slider-handle:focus {
+  box-shadow: 0 0 0 4px rgba(22, 119, 255, 0.15);
+}
+
+.percent-slider .ant-slider-handle.ant-slider-handle-dragging {
+  box-shadow: 0 0 0 5px rgba(22, 119, 255, 0.2);
+}
+
+.percent-slider .ant-slider-track {
+  background: #1677FF;
+}
+
+.percent-slider .ant-slider-rail {
+  background: #D9D9D9;
+}
+
+.percent-slider-disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}

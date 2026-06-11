@@ -3,11 +3,12 @@
  */
 import { useCallback, useState, useEffect } from 'react';
 import {
-  Switch, Button, Slider, InputNumber, Space, Typography, message,
+  Switch, Button, InputNumber, Space, Typography, message,
 } from 'antd';
 import { FolderOpenOutlined, EyeOutlined } from '@ant-design/icons';
 import { useLogoSettingsStore, useTemplateStore } from '@/store';
 import { selectFile, isLikelyBrowserPath } from '@/utils/fileDialog';
+import PercentSlider from '../shared/PercentSlider';
 
 const { Text } = Typography;
 
@@ -71,65 +72,53 @@ export default function LogoSettings() {
               )}
             </Space>
 
-            {/* 位置控制 */}
-            <Space style={{ width: '100%' }} direction="vertical" size={4}>
-              <Text style={{ color: 'var(--text-secondary)', fontSize: 12 }}>
-                中心 X: {xPercent}%
-              </Text>
-              <Slider
-                min={0} max={100}
+            {/* 位置控制：X / Y / 大小 / 透明度 */}
+            <Space direction="vertical" size={6} style={{ width: '100%' }}>
+              <PercentSlider
+                label="中心 X"
                 value={xPercent}
                 onChange={setXPercent}
-                tooltip={{ formatter: (v) => `${v}%` }}
+                min={0}
+                max={100}
               />
-              <Text style={{ color: 'var(--text-secondary)', fontSize: 12 }}>
-                中心 Y: {yPercent}%
-              </Text>
-              <Slider
-                min={0} max={100}
+              <PercentSlider
+                label="中心 Y"
                 value={yPercent}
                 onChange={setYPercent}
-                tooltip={{ formatter: (v) => `${v}%` }}
+                min={0}
+                max={100}
               />
-            </Space>
-
-            {/* 大小 */}
-            <Space style={{ width: '100%' }}>
-              <Text style={{ color: 'var(--text-secondary)', fontSize: 12, minWidth: 40 }}>
-                大小: {sizePercent}%
-              </Text>
-              <Slider
-                min={1} max={100}
+              <PercentSlider
+                label="大小"
                 value={sizePercent}
                 onChange={setSizePercent}
-                style={{ flex: 1 }}
-                tooltip={{ formatter: (v) => `${v}%` }}
+                min={1}
+                max={100}
+              />
+              <PercentSlider
+                label="透明度"
+                value={Math.round(opacity * 100)}
+                onChange={(v) => setOpacity(v / 100)}
+                min={0}
+                max={100}
               />
             </Space>
 
-            {/* 角度和透明度 */}
-            <Space>
-              <Space align="center">
-                <Text style={{ color: 'var(--text-secondary)', fontSize: 12 }}>角度:</Text>
-                <InputNumber
-                  size="small"
-                  min={0} max={360} step={5}
-                  value={angle}
-                  onChange={(v) => v !== null && setAngle(v)}
-                  addonAfter="°"
-                  style={{ width: 90 }}
-                />
-              </Space>
-              <Space align="center">
-                <Text style={{ color: 'var(--text-secondary)', fontSize: 12 }}>透明度:</Text>
-                <Slider
-                  min={0} max={100}
-                  value={Math.round(opacity * 100)}
-                  onChange={(v) => setOpacity(v / 100)}
-                  style={{ width: 120 }}
-                  tooltip={{ formatter: (v) => `${v}%` }}
-                />
-              </Space>
+            {/* 角度 */}
+            <Space align="center" style={{ width: '100%' }}>
+              <Text style={{ color: 'var(--text-secondary)', fontSize: 12, minWidth: 50 }}>
+                角度
+              </Text>
+              <InputNumber
+                size="small"
+                min={0}
+                max={360}
+                step={5}
+                value={angle}
+                onChange={(v) => v !== null && setAngle(v)}
+                addonAfter="°"
+                style={{ width: 100 }}
+              />
             </Space>
           </>
         )}
